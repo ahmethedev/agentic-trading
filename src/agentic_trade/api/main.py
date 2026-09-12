@@ -13,13 +13,16 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from ..config import get_settings
 from ..db import pool
+from .product import ALLOWED_ORIGINS, authorised
+from .product import router as product_router
 
 VENUE = "okx-tr"
 # Built dashboard, present in the deployed image; absent during local dev where
@@ -29,16 +32,43 @@ DASHBOARD_DIST = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await pool.init_pools(get_settings().database_url)
+    await pool.init_pools(get_settings().database_url, read_only=True)
     yield
     await pool.close_pools()
 
 
-app = FastAPI(title="Agentic Trade", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ThatsMyQuant", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_methods=["GET"], allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE"], allow_credentials=True, allow_headers=["*"],
 )
+
+
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["localhost", "127.0.0.1", "[::1]"])
+
+
+@app.middleware("http")
+async def product_boundary(request: Request, call_next):
+    if request.url.path.startswith("/api/"):
+        origin = request.headers.get("origin")
+        if origin and origin not in ALLOWED_ORIGINS:
+            return JSONResponse({"detail": "Bu kaynaktan erişim kabul edilmiyor."}, status_code=403)
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not origin:
+            return JSONResponse({"detail": "Origin başlığı gerekli."}, status_code=403)
+        public = {"/api/candles", "/api/instruments", "/api/flow",
+                  "/api/product/market", "/api/product/strategy", "/api/product/session",
+                  "/api/product/ask"}
+        if request.url.path not in public and not authorised(request):
+            return JSONResponse({"detail": "Operatör oturumu gerekli."}, status_code=401)
+    try:
+        return await call_next(request)
+    except Exception:
+        # Never send SQL, DSNs or exception bodies to the browser.
+        return JSONResponse({"detail": "Veri servisine ulaşılamadı. Bağlantıyı kontrol edin."},
+                            status_code=503)
+
+
+app.include_router(product_router)
 
 
 def _j(v: Any) -> Any:
@@ -51,7 +81,8 @@ async def status() -> dict[str, Any]:
     s = get_settings()
     async with pool.ledger().acquire() as con:
         run = await con.fetchrow(
-            "SELECT * FROM runs ORDER BY run_id DESC LIMIT 1"
+            """SELECT * FROM runs WHERE code_version IS NOT NULL
+               AND mode IN ('live','observe') ORDER BY run_id DESC LIMIT 1"""
         )
         gaps = await con.fetchval(
             "SELECT count(*) FROM data_gaps WHERE detected_at > now() - interval '1 hour'"

@@ -304,3 +304,33 @@ worker and confirm `positions` shows `CLOSED` and the fills are ingested.
    `AtkError` and the venue maps to `VenueRejected`, so a venue refusal is a clean
    rejection rather than a phantom LIVE order.
 6. `AGENTIC_TRADING_HACKATHON_PLAYBOOK.md`, referenced by AGENT.md, does not exist.
+
+## ThatsMyQuant — first product slice
+
+The product UI replaces the terminal dashboard with market discovery, strategy
+rules, a decision journal and a limited question reader. It reads the existing
+worker/store; no additional trading worker is needed. See
+[implementation status](docs/PRODUCT_PROGRESS.md) for what is and is not connected.
+The question reader is deterministic, not an LLM, and its history is session-only.
+
+Market discovery needs no operator login. Private ledger/status/decision endpoints
+now require an operator session. Set a separate, strong `APP_OPERATOR_TOKEN` in the
+**API process environment** (not a frontend/Vite variable, and not an OKX secret),
+then enter that code in **OKX bağlantısı**. Never put exchange keys in this form.
+The cookie expires after eight hours. API restart does not restart the live worker.
+
+```bash
+# Run alongside the existing worker, with DATABASE_URL configured as before.
+# APP_OPERATOR_TOKEN should already be injected into this shell's environment.
+PYTHONPATH=src .venv/bin/uvicorn agentic_trade.api.main:app --host 127.0.0.1 --port 8010
+(cd dashboard && npm install && npm run dev -- --host 127.0.0.1)
+```
+
+The API DB pools are read-only. Supported local browser origins use localhost or
+127.0.0.1 on ports 5173, 8010, 8011, 8002 or 8000. This is a single-operator local
+preview, not a public deployment. Missing operator configuration fails closed for
+private reads. Existing scripts that query PostgreSQL directly are unaffected.
+
+Tests should use an isolated PostgreSQL database, **not the production DB**:
+apply `src/agentic_trade/db/schema.sql` to that empty database and pass its DSN as
+`DATABASE_URL` when running pytest. The E2E tests prepare their own market fixture.

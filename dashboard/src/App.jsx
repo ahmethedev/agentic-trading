@@ -1,376 +1,1088 @@
-import React, { useCallback, useEffect, useState } from 'react'
-import Chart from './Chart.jsx'
+import React, { useEffect, useRef, useState } from "react";
+import Chart from "./Chart.jsx";
 import {
-  getCandles, getDecisions, getFlow, getFunnel, getInstruments, getPositions,
-  getStatus,
-} from './api.js'
+  askQuant,
+  getCandles,
+  getMarket,
+  getSession,
+  getStrategy,
+  getWorkspace,
+  login,
+  logout,
+} from "./api.js";
 
-const REFRESH_MS = 5000
+const fmt = (v, digits = 2) =>
+  v === null || v === undefined || !Number.isFinite(+v)
+    ? "—"
+    : (+v).toLocaleString("tr-TR", { maximumFractionDigits: digits });
+const stamp = (v) =>
+  v
+    ? new Date(v).toLocaleString("tr-TR", {
+        day: "2-digit",
+        month: "2-digit",
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+      })
+    : "Henüz yok";
+const modeLabel = (run) =>
+  !run
+    ? "Piyasa keşfi"
+    : run.demo
+      ? `${run.mode.toUpperCase()} · OKX demo hesabı`
+      : run.mode === "live"
+        ? "LIVE · Gerçek hesap"
+        : "OBSERVE · Emir göndermez";
+const views = [
+  { id: "overview", name: "Genel bakış", icon: "overview" },
+  { id: "strategies", name: "Stratejiler", icon: "strategy" },
+  { id: "experiments", name: "Deneyler", icon: "experiment" },
+];
+const prompts = [
+  "Piyasanın fotoğrafını çıkar",
+  "Neden işlem açmadık?",
+  "Stratejim nasıl çalışıyor?",
+  "Hangi paritelerde kurulum oluşuyor?",
+];
 
-/* Codes that mean "this check passed / is informational", not a rejection. */
-const PASS_CODES = new Set(['RECLAIM_CONFIRMED'])
-
-const fmt = (v, d = 2) =>
-  v === null || v === undefined ? '—' : Number(v).toFixed(d)
-
-/* Quantities arrive as full-precision decimals (e.g. "0.009945000000000000",
-   "0E-18"). Trim to something readable without inventing or hiding precision. */
-const qty = (v) => {
-  if (v === null || v === undefined) return '—'
-  const n = Number(v)
-  if (!Number.isFinite(n)) return String(v)
-  if (n === 0) return '0'
-  const d = n >= 1 ? 4 : 8
-  return n.toFixed(d).replace(/\.?0+$/, '')
-}
-
-/* Prices arrive as full-precision decimal strings; show a readable number of
-   significant digits without implying more precision than the tick size. */
-const price = (v) => {
-  if (v === null || v === undefined) return '—'
-  const n = Number(v)
-  if (!Number.isFinite(n)) return String(v)
-  const d = n >= 1000 ? 1 : n >= 1 ? 3 : 6
-  return n.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: d })
-}
-
-const ago = (iso) => {
-  if (!iso) return '—'
-  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000)
-  if (s < 60) return `${Math.round(s)}s ago`
-  if (s < 3600) return `${Math.floor(s / 60)}m ago`
-  return `${Math.floor(s / 3600)}h ago`
-}
-
-function StatusStrip({ status }) {
-  if (!status) return <div className="strip"><span className="pill">connecting…</span></div>
-  const stale = status.data_freshness.filter((f) => f.age_s > 45)
-  const running = status.run_started_at && !status.run_stopped_at
+function Icon({ name, ...props }) {
+  const paths = {
+    overview: (
+      <>
+        <rect x="3" y="3" width="7" height="7" rx="1.5" />
+        <rect x="14" y="3" width="7" height="7" rx="1.5" />
+        <rect x="3" y="14" width="7" height="7" rx="1.5" />
+        <rect x="14" y="14" width="7" height="7" rx="1.5" />
+      </>
+    ),
+    strategy: (
+      <>
+        <path d="M5 3v18M3 7h4M3 16h4M12 3v18M10 12h4M19 3v18M17 8h4M17 17h4" />
+      </>
+    ),
+    experiment: (
+      <>
+        <path d="M9 3h6M10 3v7l-6 9q-1 2 2 2h12q3 0 2-2l-6-9V3M7 15h10" />
+      </>
+    ),
+    link: (
+      <>
+        <path
+          d="m9 15 6-6M8 16l-1 1a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0M16 8l1-1a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0"
+          transform="translate(0 -1)"
+        />
+      </>
+    ),
+    chat: (
+      <>
+        <path d="M4 4h16v12H9l-5 4V4Z" />
+        <path d="M8 8h8M8 12h5" />
+      </>
+    ),
+    arrow: (
+      <>
+        <path d="M5 12h14m-6-6 6 6-6 6" />
+      </>
+    ),
+    check: <path d="m5 12 4 4L19 6" />,
+  };
   return (
-    <div className="strip">
-      <h1>Agentic Trade</h1>
-      <span className={`pill ${status.mode === 'live' ? 'bad' : 'warn'}`}>
-        {status.mode.toUpperCase()}
-        {status.mode_mismatch && ` (api:${status.config_mode})`}
-      </span>
-      <span className="pill">{status.site.toUpperCase()}{status.demo ? ' · DEMO' : ''}</span>
-      <span className={`pill ${status.authenticated ? 'ok' : 'bad'}`}>
-        {status.authenticated ? 'AUTHENTICATED' : `NO AUTH: ${status.missing_credentials.join(', ')}`}
-      </span>
-      <span className="pill">{status.policy_version ?? 'no policy'}</span>
-      <span className="pill">risk {(+status.risk_fraction * 100).toFixed(1)}% · cap {(+status.risk_fraction_max * 100).toFixed(1)}%</span>
-      <span className="spacer" />
-      <span className={`pill ${stale.length ? 'bad' : 'ok'}`}>
-        {stale.length ? `${stale.length} STALE FEED` : 'DATA FRESH'}
-      </span>
-      <span className={`pill ${status.gaps_last_hour ? 'warn' : 'ok'}`}>
-        gaps 1h: {status.gaps_last_hour}
-      </span>
-      <span className={`pill ${running ? 'ok' : 'bad'}`}>
-        worker {running ? 'running' : 'stopped'}
-      </span>
-      {/* Until reconciliation is clean the gate refuses every entry. */}
-      {status.reconcile && (
-        <span className={`pill ${status.reconcile.clean ? 'ok' : 'bad'}`}>
-          {status.reconcile.clean
-            ? 'reconciled'
-            : `UNRECONCILED (${(status.reconcile.unresolved ?? []).length})`}
-        </span>
-      )}
-      {status.reconcile?.unprotected_positions?.length > 0 && (
-        <span className="pill bad">
-          {status.reconcile.unprotected_positions.length} UNPROTECTED
-        </span>
-      )}
+    <svg
+      width="20"
+      height="20"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      {...props}
+    >
+      {paths[name] || paths.overview}
+    </svg>
+  );
+}
+function Empty({ title, children }) {
+  return (
+    <div className="empty">
+      <h3>{title}</h3>
+      <p>{children}</p>
     </div>
-  )
+  );
 }
-
-function DecisionCard({ d }) {
-  const f = d.features ?? {}
-  const s = f.setup ?? {}
-  const buy = d.action === 'BUY_INTENT'
+function Metric({ label, value, unit, detail }) {
   return (
-    <div className="card">
-      <div className="card-head">
-        <span className="sym">{d.inst_id}</span>
-        <span className={`badge ${buy ? 'buy' : 'wait'}`}>{d.action}</span>
-        <span className="pill">{d.stage_reached}</span>
-        <span className="time">{ago(d.decided_at)}</span>
-      </div>
-      <div className="kv">
-        <div><div className="k">close</div><div className="v">{price(f.close)}</div></div>
-        <div><div className="k">rvol</div><div className="v">{fmt(f.rvol)}</div></div>
+    <div className="metric">
+      <span>{label}</span>
+      <strong>
+        {value}
+        <small>{unit}</small>
+      </strong>
+      <p>{detail}</p>
+    </div>
+  );
+}
+function StrategyCard({ strategy, run, onAsk, expanded = false }) {
+  if (!strategy)
+    return (
+      <Empty title="Kurallar yükleniyor">Strateji servisi bekleniyor.</Empty>
+    );
+  return (
+    <section className="panel strategy-card">
+      <div className="section-head">
         <div>
-          <div className="k">flow imb</div>
-          <div className="v">{f.flow_valid ? fmt(f.flow_imbalance, 3) : 'invalid'}</div>
+          <span className="eyebrow">Benim stratejim</span>
+          <h2>{strategy.name}</h2>
         </div>
-        <div><div className="k">above ma</div><div className="v">{String(f.above_ma ?? '—')}</div></div>
-        <div><div className="k">slope/atr</div><div className="v">{fmt(f.trend_slope_atr, 4)}</div></div>
-        <div><div className="k">atr</div><div className="v">{price(f.atr)}</div></div>
+        <span className="badge">
+          {run?.health === "recent_decisions"
+            ? "İzleniyor"
+            : "Referans kurallar"}
+        </span>
       </div>
-      {s.level && (
-        <div className="kv">
-          <div><div className="k">level</div><div className="v">{price(s.level)}</div></div>
-          <div><div className="k">pullback low</div><div className="v">{price(s.pullback_low)}</div></div>
-          <div><div className="k">depth atr</div><div className="v">{fmt(s.pullback_depth_atr, 2)}</div></div>
-          <div><div className="k">ext atr</div><div className="v">{fmt(s.extension_atr, 2)}</div></div>
-        </div>
-      )}
-      {f.sizing && Object.keys(f.sizing).length > 0 && (
-        <div className="kv">
-          <div><div className="k">qty</div><div className="v">{f.sizing.quantity ?? f.sizing.rejected ?? '—'}</div></div>
-          <div><div className="k">risk budget</div><div className="v">{price(f.sizing.risk_budget)}</div></div>
-          <div><div className="k">risk at stop</div><div className="v">{price(f.sizing.risk_at_stop)}</div></div>
-          <div><div className="k">capped by</div><div className="v">{(f.sizing.capped_by ?? []).join(',') || '—'}</div></div>
-        </div>
-      )}
-      <div className="codes">
-        {d.reason_codes.map((c, i) => (
-          <span key={i} className={`code ${PASS_CODES.has(c) ? 'pass' : ''}`}>{c}</span>
-        ))}
+      <div className="rule-pills">
+        <span>15m bağlam</span>
+        <span>5m kurulum</span>
+        <span>Spot · Long</span>
+        <span>{strategy.version}</span>
       </div>
-    </div>
-  )
+      <p>
+        Geri çekilmenin ardından seviyeyi geri kazanan fiyatı, hacim ve alıcı
+        baskısıyla doğrular.
+      </p>
+      {expanded && (
+        <>
+          <ol className="rules">
+            {strategy.rules.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ol>
+          <p>{strategy.risk}</p>
+          <div className="callout">
+            <strong>Bugün çalışan çıkış</strong>
+            <p>{strategy.execution}</p>
+            <p>{strategy.exit_reference}</p>
+          </div>
+          <p className="fine">{strategy.source}</p>
+        </>
+      )}
+      <button
+        className="text-button"
+        onClick={() => onAsk("Stratejim nasıl çalışıyor?")}
+      >
+        Kuralları açıkla <Icon name="arrow" />
+      </button>
+    </section>
+  );
 }
-
-function Positions({ data }) {
-  if (!data) return null
-  const { positions, orders } = data
+function DecisionList({ data }) {
+  if (!data?.length)
+    return (
+      <Empty title="Henüz karar yok">
+        Yeni değerlendirmeler kaydedildiğinde burada görünecek.
+      </Empty>
+    );
   return (
-    <div className="panel">
-      <h2>Positions</h2>
-      {positions.length === 0 && <div className="empty">no positions yet</div>}
-      {positions.map((p) => (
-        <div className="card" key={p.position_id}>
-          <div className="card-head">
-            <span className="sym">{p.inst_id}</span>
-            <span className={`badge ${p.status === 'OPEN' ? 'buy' : 'wait'}`}>
-              {p.status}
+    <div className="decision-list">
+      {data.slice(0, 4).map((d) => (
+        <details key={d.decision_id} className="decision">
+          <summary>
+            <span className="decision-symbol">{d.inst_id.split("-")[0]}</span>
+            <span className="decision-copy">
+              <strong>{d.reasons?.[0] || d.stage_reached}</strong>
+              <small>
+                #{d.decision_id} · {stamp(d.decided_at)}
+              </small>
             </span>
-            {/* An open position without venue-side protection is an incident. */}
-            {p.status !== 'CLOSED' && (
-              <span className={`pill ${p.protected ? 'ok' : 'bad'}`}>
-                {p.protected ? 'protected' : 'UNPROTECTED'}
+            <span className="badge">
+              {d.action === "BUY_INTENT" ? "Giriş niyeti" : "Bekliyor"}
+            </span>
+          </summary>
+          <div className="decision-detail">
+            <p>{d.reasons.join(" · ")}</p>
+            <p>
+              Göreli hacim {fmt(d.features?.rvol)} · Akış{" "}
+              {fmt(d.features?.flow_imbalance, 3)}
+            </p>
+            <p className="fine">
+              Run #{d.run_id} · Mum {stamp(d.candle_open_time)} ·{" "}
+              {d.stage_reached}
+            </p>
+          </div>
+        </details>
+      ))}
+    </div>
+  );
+}
+function Chat({ selected, onNavigate, opened, onClose }) {
+  const [draft, setDraft] = useState(""),
+    [messages, setMessages] = useState([]),
+    [busy, setBusy] = useState(false);
+  const [newReply, setNewReply] = useState(false);
+  const [compact, setCompact] = useState(window.innerWidth < 1200);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width:1199px)");
+    const update = () => setCompact(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+  const scroller = useRef(null),
+    nearBottom = useRef(true),
+    input = useRef(null),
+    inFlight = useRef(false);
+  const scroll = () => {
+    scroller.current?.scrollTo({ top: scroller.current.scrollHeight });
+    setNewReply(false);
+  };
+  useEffect(() => {
+    const handler = (e) => send(e.detail);
+    window.addEventListener("quant-ask", handler);
+    return () => window.removeEventListener("quant-ask", handler);
+  }, [selected, busy]);
+  useEffect(() => {
+    if (opened) input.current?.focus();
+  }, [opened]);
+  useEffect(() => {
+    if (nearBottom.current) scroll();
+    else setNewReply(true);
+  }, [messages, busy]);
+  async function send(text) {
+    if (inFlight.current || !text.trim()) return;
+    inFlight.current = true;
+    setBusy(true);
+    setDraft("");
+    setMessages((m) => [
+      ...m,
+      {
+        role: "user",
+        text,
+        context: /piyasa|pariteler/i.test(text)
+          ? "İzlenen pariteler"
+          : selected || "İzlenen pariteler",
+      },
+    ]);
+    try {
+      const answer = await askQuant(text, selected || null);
+      setMessages((m) => [...m, { role: "assistant", ...answer }]);
+    } catch (error) {
+      setMessages((m) => [...m, { role: "error", text: error.message }]);
+    } finally {
+      inFlight.current = false;
+      setBusy(false);
+    }
+  }
+  return (
+    <aside
+      className={`chat-panel ${opened ? "is-open" : ""}`}
+      aria-label="Ask My Quant"
+      role={compact && opened ? "dialog" : undefined}
+      aria-modal={compact && opened ? true : undefined}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+        if (e.key === "Tab" && compact && opened) {
+          const items = [
+            ...e.currentTarget.querySelectorAll(
+              "button:not(:disabled),textarea,summary",
+            ),
+          ].filter((el) => el.getClientRects().length);
+          const first = items[0],
+            last = items.at(-1);
+          if (e.shiftKey && document.activeElement === first) {
+            e.preventDefault();
+            last?.focus();
+          } else if (!e.shiftKey && document.activeElement === last) {
+            e.preventDefault();
+            first?.focus();
+          }
+        }
+      }}
+    >
+      <div className="chat-heading">
+        <div className="quant-avatar">
+          <Icon name="chat" />
+        </div>
+        <div>
+          <h2>Ask My Quant</h2>
+          <span>Kayıtlarla düşün.</span>
+        </div>
+        <button
+          className="chat-close"
+          onClick={onClose}
+          aria-label="Sohbeti kapat"
+        >
+          ×
+        </button>
+      </div>
+      <div
+        className="chat-scroll"
+        ref={scroller}
+        onScroll={() => {
+          const el = scroller.current;
+          nearBottom.current =
+            el.scrollHeight - el.scrollTop - el.clientHeight < 70;
+        }}
+      >
+        <div className="welcome">
+          <span className="eyebrow">Piyasadan kanıta</span>
+          <h3>Birlikte neyi inceleyelim?</h3>
+          <p>
+            Stratejinin ne gördüğünü ve neden beklediğini gerçek kayıtlardan
+            incele.
+          </p>
+        </div>
+        <div className="prompts">
+          {prompts.map((p) => (
+            <button key={p} disabled={busy} onClick={() => send(p)}>
+              {p}
+              <Icon name="arrow" />
+            </button>
+          ))}
+        </div>
+        <p className="fine reader-note">
+          İlk sürüm: sınırlı sorgu asistanı. LLM bağlı değil; konuşma bu sayfa
+          oturumunda tutulur.
+        </p>
+        <div aria-live="polite" aria-relevant="additions">
+          {messages.map((m, i) => (
+            <article key={i} className={`message ${m.role}`}>
+              <span className="message-author">
+                {m.role === "user"
+                  ? `Siz · ${m.context}`
+                  : m.role === "error"
+                    ? "Sorgu tamamlanamadı"
+                    : "My Quant"}
               </span>
-            )}
-            <span className="time">{ago(p.opened_at)}</span>
-          </div>
-          <div className="kv">
-            <div><div className="k">entry</div><div className="v">{price(p.avg_entry_px)}</div></div>
-            <div><div className="k">stop</div><div className="v">{price(p.current_stop_px ?? p.initial_stop_px)}</div></div>
-            <div><div className="k">qty open</div><div className="v">{qty(p.qty_open)}</div></div>
-            <div><div className="k">realized R</div><div className="v">{p.realized_r ?? '—'}</div></div>
-            <div><div className="k">realized pnl</div><div className="v">{price(p.realized_pnl)}</div></div>
-            <div><div className="k">fees</div><div className="v">{price(p.fees_paid)}</div></div>
-          </div>
-          <div className="codes">
-            <span className={`code ${p.breakeven_moved ? 'pass' : ''}`}>
-              +1R breakeven {p.breakeven_moved ? 'done' : 'pending'}
-            </span>
-            <span className={`code ${p.tp1_done ? 'pass' : ''}`}>
-              +2R tp1 {p.tp1_done ? 'done' : 'pending'}
-            </span>
-            <span className={`code ${p.tp2_done ? 'pass' : ''}`}>
-              +2.5R tp2 {p.tp2_done ? 'done' : 'pending'}
-            </span>
-          </div>
+              <p>{m.text}</p>
+              {m.tool && (
+                <>
+                  <details className="evidence">
+                    <summary>Kaynağı gör · {m.duration_ms} ms</summary>
+                    <p>
+                      Uygulama aracı: {m.tool}
+                      <br />
+                      {stamp(m.as_of)}
+                      <br />
+                      Kaynak: mevcut PostgreSQL kayıtları.
+                    </p>
+                    {m.data?.run && (
+                      <p>
+                        Run #{m.data.run.run_id} · {modeLabel(m.data.run)}
+                      </p>
+                    )}
+                    <p>Motor: {m.engine}</p>
+                  </details>
+                  <button
+                    className="text-button"
+                    onClick={() =>
+                      onNavigate(
+                        m.tool === "get_strategy" ? "strategies" : "overview",
+                      )
+                    }
+                  >
+                    İlgili görünümü aç <Icon name="arrow" />
+                  </button>
+                </>
+              )}
+            </article>
+          ))}
         </div>
-      ))}
-      {orders.length > 0 && (
-        <>
-          <h2 style={{ marginTop: 14 }}>Orders</h2>
-          <table>
-            <thead>
-              <tr><th>Purpose</th><th>Type</th><th>Status</th><th>Filled</th><th>Avg</th></tr>
-            </thead>
-            <tbody>
-              {orders.slice(0, 10).map((o) => (
-                <tr key={o.client_order_id}>
-                  <td>{o.purpose}</td>
-                  <td className="muted">{o.ord_type}</td>
-                  <td className={o.status === 'REJECTED' || o.status === 'UNKNOWN' ? 'code' : ''}>
-                    {o.status}
-                  </td>
-                  <td>{qty(o.qty_filled)}/{qty(o.qty_requested)}</td>
-                  <td>{o.avg_px ? price(o.avg_px) : '—'}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </>
-      )}
-    </div>
-  )
-}
-
-function Funnel({ funnel }) {
-  if (!funnel) return null
-  const max = Math.max(1, ...funnel.stages.map((s) => s.evaluations))
-  return (
-    <div className="panel">
-      <h2>Opportunity funnel · {funnel.window_hours}h</h2>
-      {funnel.stages.length === 0 && <div className="empty">no evaluations yet</div>}
-      {funnel.stages.map((s) => (
-        <div className="funnel-row" key={s.stage}>
-          <span className="funnel-label">{s.stage}</span>
-          <div className="funnel-bar" style={{ width: `${(s.evaluations / max) * 55}%` }} />
-          <span className="funnel-n">{s.evaluations}</span>
-          {s.episodes > 0 && <span className="muted">· {s.episodes} ep</span>}
-        </div>
-      ))}
-      <div className="note">
-        Bars count evaluations; “ep” counts distinct setup episodes, so one setup
-        seen across many bars is not inflated into many opportunities.
-        {funnel.seconds_since_last_confirmed !== null
-          ? ` Last confirmed candidate ${Math.round(funnel.seconds_since_last_confirmed / 60)}m ago.`
-          : ' No confirmed candidate yet in this window.'}
+        {busy && (
+          <p className="query-status" role="status">
+            Kayıtlar sorgulanıyor…
+          </p>
+        )}
       </div>
-    </div>
-  )
+      {newReply && (
+        <button className="new-reply" onClick={scroll}>
+          Yeni cevap ↓
+        </button>
+      )}
+      <form
+        className="chat-composer"
+        onSubmit={(e) => {
+          e.preventDefault();
+          send(draft);
+        }}
+      >
+        <label htmlFor="question">
+          {selected || "İzlenen pariteler"} hakkında sor
+        </label>
+        <div>
+          <textarea
+            id="question"
+            ref={input}
+            value={draft}
+            maxLength={1000}
+            rows={2}
+            placeholder="Örn. Hacim neden yetersiz?"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                send(draft);
+              }
+            }}
+          />
+          <button
+            className="primary send"
+            disabled={busy || draft.trim().length < 2}
+            aria-label="Soruyu gönder"
+          >
+            <Icon name="arrow" />
+          </button>
+        </div>
+        <span className="fine">Enter gönderir · Shift + Enter yeni satır</span>
+      </form>
+    </aside>
+  );
 }
-
-function ReasonCodes({ funnel }) {
-  if (!funnel?.reason_codes?.length) return null
+function Connection({ session, connection, onSession, error }) {
+  const [token, setToken] = useState(""),
+    [busy, setBusy] = useState(false),
+    [failure, setFailure] = useState("");
+  async function submit(e) {
+    e.preventDefault();
+    setBusy(true);
+    setFailure("");
+    try {
+      await login(token);
+      setToken("");
+      await onSession();
+    } catch (err) {
+      setFailure(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
   return (
-    <div className="panel">
-      <h2>Why not / why yes</h2>
-      <table>
-        <thead><tr><th>Reason code</th><th style={{ textAlign: 'right' }}>Count</th></tr></thead>
-        <tbody>
-          {funnel.reason_codes.map((r) => (
-            <tr key={r.code}>
-              <td>{r.code}</td>
-              <td style={{ textAlign: 'right' }}>{r.count}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
-  )
-}
-
-function DataHealth({ status }) {
-  if (!status) return null
-  return (
-    <div className="panel">
-      <h2>Data health</h2>
-      <table>
-        <thead>
-          <tr><th>Instrument</th><th>Last print</th><th>Trades/60s</th></tr>
-        </thead>
-        <tbody>
-          {status.data_freshness.map((f) => (
-            <tr key={f.inst_id}>
-              <td>{f.inst_id}</td>
-              <td className={f.age_s > 45 ? 'code' : ''}>{fmt(f.age_s, 0)}s</td>
-              <td>{f.trades_60s}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {status.ops_events.length > 0 && (
+    <section className="panel connection">
+      <span className="eyebrow">OKX bağlantısı</span>
+      <h2>Hesabın kontrolü sende.</h2>
+      <p>
+        Piyasa keşfi anahtar gerektirmez. Özel hesap kayıtları için bu
+        uygulamanın operatör oturumunu aç.
+      </p>
+      {!session?.authenticated ? (
+        <form onSubmit={submit}>
+          <label htmlFor="operator">Operatör erişim kodu</label>
+          <input
+            id="operator"
+            type="password"
+            autoComplete="current-password"
+            value={token}
+            onChange={(e) => setToken(e.target.value)}
+            required
+          />
+          <p className="fine">
+            OKX API anahtarını buraya yazma. Bu kod yerel uygulama erişimi
+            içindir.
+          </p>
+          <button className="primary" disabled={busy || !token}>
+            {busy ? "Oturum açılıyor…" : "Oturumu aç"}
+          </button>
+          {!session?.configured && (
+            <p className="callout">
+              API'de operatör erişimi henüz yapılandırılmamış. Kurulum adımı
+              README'de.
+            </p>
+          )}
+        </form>
+      ) : (
         <>
-          <h2 style={{ marginTop: 14 }}>Ops events</h2>
-          <table>
-            <tbody>
-              {status.ops_events.slice(0, 6).map((e, i) => (
-                <tr key={i}>
-                  <td className="muted">{ago(e.ts)}</td>
-                  <td>{e.kind}</td>
-                  <td className={e.severity === 'error' ? 'code' : 'muted'}>{e.severity}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <span className="badge success">Operatör oturumu açık</span>
+          <dl className="connection-grid">
+            <dt>Hesap</dt>
+            <dd>{connection?.alias || "Kayıt bekleniyor"}</dd>
+            <dt>Son başlangıç kontrolü</dt>
+            <dd>{stamp(connection?.last_check)}</dd>
+            <dt>Başlangıç mutabakatı</dt>
+            <dd>
+              {connection?.reconciled_at_start === true
+                ? "Temiz"
+                : connection?.reconciled_at_start === false
+                  ? "Tamamlanmadı"
+                  : "Doğrulanmadı"}
+            </dd>
+            <dt>İzinler</dt>
+            <dd>{connection?.permissions || "Doğrulanmadı"}</dd>
+          </dl>
+          <div className="callout">
+            <strong>Anahtar saklama</strong>
+            <p>{connection?.storage || "Saklama bilgisi alınamadı."}</p>
+          </div>
+          <button
+            className="secondary"
+            onClick={async () => {
+              await logout();
+              await onSession();
+            }}
+          >
+            Operatör oturumunu kapat
+          </button>
+          <p className="fine">
+            Oturumu kapatmak çalışan stratejiyi veya borsadaki emirleri
+            durdurmaz.
+          </p>
         </>
       )}
-    </div>
-  )
+      {(failure || error) && (
+        <p role="alert" className="error">
+          {failure || error}
+        </p>
+      )}
+      <details className="integration">
+        <summary>Entegrasyon ayrıntıları</summary>
+        <p>
+          Bu ekran ATK ile worker'ın topladığı PostgreSQL kayıtlarını okur. Her
+          soruda borsaya yeni bir çağrı yapılmaz.
+        </p>
+        <p>
+          Kalıcı ATK araç çağrı izi henüz tutulmuyor; doğrulanmış araç sayısı bu
+          sürümde hesaplanmıyor. Kanıt matrisi geliştirme raporunda.
+        </p>
+      </details>
+    </section>
+  );
 }
 
 export default function App() {
-  const [status, setStatus] = useState(null)
-  const [decisions, setDecisions] = useState([])
-  const [funnel, setFunnel] = useState(null)
-  const [instruments, setInstruments] = useState([])
-  const [selected, setSelected] = useState(null)
-  const [candles, setCandles] = useState([])
-  const [positions, setPositions] = useState(null)
-  const [err, setErr] = useState(null)
-
-  useEffect(() => {
-    getInstruments().then((xs) => {
-      setInstruments(xs)
-      if (xs.length && !selected) setSelected(xs[0].inst_id)
-    }).catch((e) => setErr(e.message))
-  }, [])
-
-  const refresh = useCallback(async () => {
-    try {
-      const [st, de, fu, po] = await Promise.all([
-        getStatus(), getDecisions(null, 30), getFunnel(6), getPositions(),
-      ])
-      setStatus(st); setDecisions(de); setFunnel(fu); setPositions(po); setErr(null)
-      if (selected) setCandles(await getCandles(selected, '5m'))
-    } catch (e) { setErr(e.message) }
-  }, [selected])
-
-  useEffect(() => {
-    refresh()
-    const id = setInterval(refresh, REFRESH_MS)
-    return () => clearInterval(id)
-  }, [refresh])
-
-  const latestForSelected = decisions.find((d) => d.inst_id === selected)
-  const setup = latestForSelected?.features?.setup ?? {}
-  const markers = {
-    level: setup.level ? Number(setup.level) : null,
-    stop: setup.pullback_low ? Number(setup.pullback_low) : null,
+  const [view, setView] = useState("overview"),
+    [market, setMarket] = useState(null),
+    [data, setData] = useState(null),
+    [strategy, setStrategy] = useState(null),
+    [session, setSession] = useState(null);
+  const [selected, setSelected] = useState("BTC-USDT"),
+    [candles, setCandles] = useState([]),
+    [bar, setBar] = useState("5m"),
+    [error, setError] = useState(""),
+    [privateError, setPrivateError] = useState(""),
+    [chartError, setChartError] = useState(""),
+    [chatOpen, setChatOpen] = useState(false);
+  const chatButton = useRef(null);
+  async function refreshSession() {
+    const s = await getSession();
+    setSession(s);
+    if (!s.authenticated) {
+      setData(null);
+      setPrivateError("");
+    }
   }
-
+  useEffect(() => {
+    refreshSession().catch((e) => setError(e.message));
+    getStrategy()
+      .then(setStrategy)
+      .catch((e) => setError(e.message));
+  }, []);
+  useEffect(() => {
+    let active = true;
+    let timer;
+    async function poll() {
+      try {
+        const m = await getMarket();
+        if (active) {
+          setMarket(m);
+          setError("");
+        }
+      } catch (e) {
+        if (active) setError(e.message);
+      }
+      if (active) timer = setTimeout(poll, 10000);
+    }
+    poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, []);
+  useEffect(() => {
+    if (!session?.authenticated) return;
+    let active = true,
+      timer;
+    async function poll() {
+      try {
+        const w = await getWorkspace();
+        if (active) {
+          setData(w);
+          setPrivateError("");
+        }
+      } catch (e) {
+        if (active) setPrivateError(e.message);
+      }
+      if (active) timer = setTimeout(poll, 10000);
+    }
+    poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [session?.authenticated]);
+  useEffect(() => {
+    let active = true,
+      timer;
+    setCandles([]);
+    setChartError("");
+    async function poll() {
+      try {
+        const c = await getCandles(selected, bar);
+        if (active) {
+          setCandles(c);
+          setChartError("");
+        }
+      } catch (e) {
+        if (active) setChartError(e.message);
+      }
+      if (active) timer = setTimeout(poll, 10000);
+    }
+    poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [selected, bar]);
+  const current = market?.instruments.find((i) => i.inst_id === selected),
+    run = data?.run,
+    ledger = data?.ledger,
+    funnel = data?.funnel;
+  const last = candles.at(-1);
+  function ask(message) {
+    setChatOpen(true);
+    window.dispatchEvent(new CustomEvent("quant-ask", { detail: message }));
+  }
+  function closeChat() {
+    setChatOpen(false);
+    chatButton.current?.focus();
+  }
   return (
-    <div className="app">
-      <StatusStrip status={status} />
-      {err && <div className="panel" style={{ marginBottom: 14 }}>
-        <span className="code">API error: {err}</span>
-      </div>}
-
-      <div className="tabs">
-        {instruments.map((i) => (
-          <button
-            key={i.inst_id}
-            className={`tab ${selected === i.inst_id ? 'active' : ''}`}
-            onClick={() => setSelected(i.inst_id)}
-          >{i.inst_id}</button>
-        ))}
-      </div>
-
-      <div className="grid">
-        <div className="stack">
-          <div className="panel">
-            <h2>{selected ?? '—'} · 5m</h2>
-            <Chart candles={candles} markers={markers} />
-            <div className="note">
-              Dashed blue = the level defined by earlier closed candles; dashed red =
-              the structural stop (pullback low). Both come from the stored decision
-              record, not recomputed here.
-            </div>
-          </div>
-          <div className="panel">
-            <h2>Decision cards</h2>
-            {decisions.length === 0 && <div className="empty">no decisions recorded yet</div>}
-            {decisions.slice(0, 12).map((d) => <DecisionCard key={d.decision_id} d={d} />)}
-          </div>
+    <div className="quant-app">
+      <a className="skip-link" href="#main">
+        İçeriğe geç
+      </a>
+      <nav className="sidebar" aria-label="Ana gezinme">
+        <a
+          href="#"
+          className="brand"
+          onClick={(e) => {
+            e.preventDefault();
+            setView("overview");
+          }}
+        >
+          <span className="brand-mark">
+            Q<span>·</span>
+          </span>
+          <span>
+            ThatsMyQuant<small>Kişisel quant çalışma alanı</small>
+          </span>
+        </a>
+        <div className="nav-items">
+          {views.map((v) => (
+            <button
+              key={v.id}
+              className={view === v.id ? "active" : ""}
+              aria-current={view === v.id ? "page" : undefined}
+              onClick={() => setView(v.id)}
+            >
+              <Icon name={v.icon} />
+              <span>{v.name}</span>
+            </button>
+          ))}
         </div>
-
-        <div className="stack">
-          <Positions data={positions} />
-          <Funnel funnel={funnel} />
-          <DataHealth status={status} />
-          <ReasonCodes funnel={funnel} />
+        <div className="nav-bottom">
+          <p>
+            Fikrini kurala.
+            <br />
+            Kuralını kanıta dönüştür.
+          </p>
+          <button
+            aria-label="OKX bağlantısı"
+            className={view === "connection" ? "active" : ""}
+            onClick={() => setView("connection")}
+            aria-current={view === "connection" ? "page" : undefined}
+          >
+            <Icon name="link" />
+            <span>OKX bağlantısı</span>
+          </button>
+          <span className="local-label">Yerel operatör · İlk ürün sürümü</span>
+        </div>
+      </nav>
+      <div className="app-body">
+        <header className="topbar">
+          <span>
+            {views.find((v) => v.id === view)?.name || "OKX bağlantısı"}
+          </span>
+          <div>
+            <span className="source-label">OKX TR</span>
+            <span className={`badge ${run?.mode === "live" ? "live" : ""}`}>
+              {modeLabel(run)}
+            </span>
+            <button
+              className="account-button"
+              onClick={() => setView("connection")}
+            >
+              {session?.authenticated ? "Operatör" : "Oturum aç"}
+              <span className="account-avatar">
+                {session?.authenticated ? "O" : "↗"}
+              </span>
+            </button>
+          </div>
+        </header>
+        <div className="workspace">
+          <main id="main" tabIndex={-1}>
+            <div className="page-heading">
+              <div>
+                <span className="eyebrow">
+                  {view === "overview"
+                    ? "Piyasa çalışma alanın"
+                    : "ThatsMyQuant"}
+                </span>
+                <h1>
+                  {view === "overview"
+                    ? "Önce anla. Sonra karar ver."
+                    : view === "strategies"
+                      ? "Kuralların, açık ve ölçülebilir."
+                      : view === "experiments"
+                        ? "Bir değişiklik. Bir deney."
+                        : "Güvenilir bir bağlantı."}
+                </h1>
+              </div>
+              <button
+                className="chat-toggle secondary"
+                ref={chatButton}
+                aria-expanded={chatOpen}
+                onClick={() => setChatOpen(!chatOpen)}
+              >
+                <Icon name="chat" />
+                Quant'a sor
+              </button>
+            </div>
+            {(error || privateError) && (
+              <div className="error" role="alert">
+                {error || privateError}{" "}
+                {market &&
+                  `Son başarılı veri: ${stamp(market.as_of)}. Gösterilen değerler eski olabilir.`}
+              </div>
+            )}
+            {view === "overview" && (
+              <>
+                <div className="market-summary">
+                  <span
+                    className={`status-dot ${!error && current && !current.stale ? "fresh" : ""}`}
+                  />
+                  <p>
+                    {current
+                      ? `${current.regime}. ${current.reasons[0] || "Kurulum verisi bekleniyor"}.`
+                      : "Piyasa kayıtları alınıyor…"}
+                  </p>
+                  <time>{stamp(market?.as_of)}</time>
+                </div>
+                <div className="metrics">
+                  <Metric
+                    label="Son işlem fiyatı"
+                    value={fmt(current?.px)}
+                    unit="USDT"
+                    detail={
+                      current?.ts
+                        ? `${selected} · ${stamp(current.ts)}`
+                        : "Gerçek piyasa verisi bekleniyor"
+                    }
+                  />
+                  <Metric
+                    label="Göreli hacim"
+                    value={fmt(current?.features?.rvol)}
+                    unit="×"
+                    detail={`5m kapanış · Teyit eşiği 1,30${current?.decision_stale ? " · Ölçüm eski" : ""}`}
+                  />
+                  <Metric
+                    label="Açık risk baz tutarı"
+                    value={fmt(ledger?.open_risk_quote)}
+                    unit="USDT"
+                    detail={
+                      ledger
+                        ? `${ledger.open_positions} pozisyon · ilk risk bazı`
+                        : "Hesap görünümü için oturum aç"
+                    }
+                  />
+                  <Metric
+                    label="Kayıtlı net sonuç"
+                    value={fmt(ledger?.realized_net_quote)}
+                    unit="USDT"
+                    detail={
+                      ledger
+                        ? `${ledger.closed_positions} kapalı pozisyon · ledger`
+                        : "Canlı ve simüle sonuçlar ayrılır"
+                    }
+                  />
+                </div>
+                <section className="panel chart-panel">
+                  <div className="chart-head">
+                    <div
+                      className="instrument-tabs"
+                      role="group"
+                      aria-label="Parite"
+                    >
+                      {(market?.instruments.length
+                        ? market.instruments.map((i) => i.inst_id)
+                        : ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+                      ).map((i) => (
+                        <button
+                          key={i}
+                          aria-pressed={selected === i}
+                          className={selected === i ? "selected" : ""}
+                          onClick={() => setSelected(i)}
+                        >
+                          {i.split("-")[0]}
+                          <span>/ USDT</span>
+                        </button>
+                      ))}
+                    </div>
+                    <select
+                      aria-label="Grafik zaman ölçeği"
+                      value={bar}
+                      onChange={(e) => setBar(e.target.value)}
+                    >
+                      <option value="1m">1 dakika</option>
+                      <option value="5m">5 dakika</option>
+                      <option value="15m">15 dakika</option>
+                    </select>
+                  </div>
+                  <div className="chart-caption">
+                    <span>
+                      Fiyat & hacim <small>· OKX TR · USDT</small>
+                    </span>
+                    <span>
+                      {current?.stale
+                        ? "Veri eski"
+                        : current
+                          ? "Son trade güncel"
+                          : "Veri bekleniyor"}{" "}
+                      · Spread{" "}
+                      {current?.book_stale
+                        ? "— (eski)"
+                        : fmt(current?.spread_bps)}{" "}
+                      bp
+                    </span>
+                  </div>
+                  {chartError && (
+                    <p role="alert" className="error">
+                      {chartError}
+                    </p>
+                  )}
+                  <Chart
+                    candles={candles}
+                    fills={ledger?.fills}
+                    bar={bar}
+                    instrument={`${selected}:${bar}`}
+                    markers={{
+                      level: current?.features?.setup?.level,
+                      stop: current?.features?.setup?.pullback_low,
+                    }}
+                  />
+                  {!candles.length && (
+                    <p className="chart-empty">
+                      {chartError
+                        ? "Grafik verisi alınamadı."
+                        : "Mum kaydı bekleniyor."}
+                    </p>
+                  )}
+                  <div className="chart-footer">
+                    <span>
+                      Son mum: O {fmt(last?.open)} · H {fmt(last?.high)} · L{" "}
+                      {fmt(last?.low)} · C {fmt(last?.close)} · V{" "}
+                      {fmt(last?.volume, 0)} USDT
+                    </span>
+                    <span>
+                      {last
+                        ? last.confirm
+                          ? "Kapanmış mum"
+                          : "Oluşan mum · sinyal değildir"
+                        : "—"}
+                    </span>
+                  </div>
+                </section>
+                <div className="lower-grid">
+                  <StrategyCard strategy={strategy} run={run} onAsk={ask} />
+                  <section className="panel">
+                    <div className="section-head">
+                      <div>
+                        <span className="eyebrow">Karar günlüğü</span>
+                        <h2>Neyi bekliyoruz?</h2>
+                      </div>
+                      <button
+                        className="text-button"
+                        onClick={() => ask("Neden işlem açmadık?")}
+                      >
+                        İncele <Icon name="arrow" />
+                      </button>
+                    </div>
+                    {session?.authenticated ? (
+                      <DecisionList data={data?.decisions} />
+                    ) : (
+                      <Empty title="Stratejinin kararlarını gör">
+                        <button
+                          className="text-button"
+                          onClick={() => setView("connection")}
+                        >
+                          Operatör oturumunu aç →
+                        </button>
+                      </Empty>
+                    )}
+                  </section>
+                </div>
+                {funnel && (
+                  <section className="panel funnel">
+                    <div>
+                      <h2>
+                        Karar akışı{" "}
+                        <span className="badge">Run #{run.run_id}</span>
+                      </h2>
+                      <p>
+                        {stamp(funnel.since)} — {stamp(funnel.until)}
+                      </p>
+                    </div>
+                    <div className="funnel-counts">
+                      <span>
+                        <strong>{funnel.evaluations}</strong> değerlendirme
+                      </span>
+                      <span>
+                        <strong>{funnel.unique_candles}</strong> farklı
+                        parite/mum
+                      </span>
+                      <span>
+                        <strong>{funnel.episodes}</strong> kurulum bölümü
+                      </span>
+                      <span>
+                        <strong>{funnel.confirmed}</strong> onaylı değerlendirme
+                      </span>
+                    </div>
+                    <p className="fine">
+                      Tekrar değerlendirmeler bağımsız fırsat değildir. Çalışma
+                      durumu:{" "}
+                      {run.health === "recent_decisions"
+                        ? "Yakın zamanda karar üretti"
+                        : run.health === "stopped"
+                          ? "Durduruldu"
+                          : "Heartbeat doğrulanamıyor"}
+                      .
+                    </p>
+                  </section>
+                )}
+                {ledger && (
+                  <section className="panel">
+                    <h2>Gerçekleşen işlemler</h2>
+                    <p className="fine">
+                      {ledger.scope}. {ledger.limitation}
+                    </p>
+                    {ledger.fills.length ? (
+                      <div className="table-scroll">
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>Parite</th>
+                              <th>Yön</th>
+                              <th>Fiyat</th>
+                              <th>Miktar</th>
+                              <th>Ücret</th>
+                              <th>Zaman</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {ledger.fills.map((f, i) => (
+                              <tr key={i}>
+                                <td>{f.inst_id}</td>
+                                <td>{f.side === "buy" ? "Alış" : "Satış"}</td>
+                                <td>{fmt(f.px)} USDT</td>
+                                <td>{fmt(f.qty, 8)}</td>
+                                <td>
+                                  {fmt(f.fee, 8)} {f.fee_ccy}
+                                </td>
+                                <td>{stamp(f.ts)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <Empty title="Henüz gerçekleşmiş işlem yok">
+                        Sinyal ve giriş niyeti, gerçekleşmiş işlem olarak
+                        gösterilmez.
+                      </Empty>
+                    )}
+                  </section>
+                )}
+              </>
+            )}
+            {view === "strategies" && (
+              <>
+                <StrategyCard
+                  strategy={strategy}
+                  run={run}
+                  onAsk={ask}
+                  expanded
+                />
+                <section className="panel">
+                  <h2>Bir fikri deneye dönüştür</h2>
+                  <p>
+                    Bir sonraki teslim: desteklenen şablondan taslak oluşturma,
+                    tek kuralı değiştirme ve ayrı sürüm kaydetme.
+                  </p>
+                  <div className="callout">
+                    Taslak editörü ve gölge başlatma henüz uygulanmadı. Aktif
+                    strateji bu görünümden değiştirilemez.
+                  </div>
+                </section>
+              </>
+            )}
+            {view === "experiments" && (
+              <section className="panel experiment-empty">
+                <div className="large-icon">
+                  <Icon name="experiment" width="32" height="32" />
+                </div>
+                <h2>İlk deneyin için yer hazır.</h2>
+                <p>
+                  Baseline ile tek kuralı değişen alternatifi, sermaye ayırmadan
+                  karşılaştıracağız.
+                </p>
+                <div className="experiment-steps">
+                  <span>01 · Kuralı seç</span>
+                  <span>02 · Gölge izle</span>
+                  <span>03 · Kanıtı karşılaştır</span>
+                </div>
+                <p className="callout">
+                  Gölge evaluator bu teslimde bağlı değil. Çalışma veya simüle
+                  sonuç üretilmedi.
+                </p>
+                <button
+                  className="secondary"
+                  onClick={() => setView("strategies")}
+                >
+                  Başlangıç kurallarını incele <Icon name="arrow" />
+                </button>
+              </section>
+            )}
+            {view === "connection" && (
+              <Connection
+                session={session}
+                connection={data?.connection}
+                onSession={refreshSession}
+                error={privateError}
+              />
+            )}
+            <footer className="page-footer">
+              ThatsMyQuant{" "}
+              <span>Ölçümler kayıtlardan. Kararlar kurallardan.</span>
+            </footer>
+          </main>
+          <Chat
+            selected={selected}
+            opened={chatOpen}
+            onClose={closeChat}
+            onNavigate={(v) => {
+              setView(v);
+              setChatOpen(false);
+            }}
+          />
         </div>
       </div>
     </div>
-  )
+  );
 }

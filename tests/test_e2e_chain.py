@@ -9,6 +9,7 @@ from __future__ import annotations
 from decimal import Decimal
 
 import pytest
+import pytest_asyncio
 
 from agentic_trade.config import get_settings
 from agentic_trade.db import pool
@@ -23,6 +24,26 @@ D = Decimal
 INST = "BTC-USDT"
 SPEC = InstrumentSpec(INST, lot_sz=D("0.00000001"), min_sz=D("0.00001"),
                       tick_sz=D("0.1"))
+
+
+@pytest_asyncio.fixture(autouse=True, loop_scope="session")
+async def fresh_market_print(run_id):
+    """The gate needs a fresh print; never depend on a live production poller."""
+    async with pool.market().acquire() as con:
+        await con.execute(
+            """INSERT INTO market_trades (venue,inst_id,trade_id,ts,px,sz,side,run_id)
+               VALUES ('test-e2e',$1,$2,now(),101,1,'buy',$2)""", INST, run_id)
+        inserted = await con.fetchval(
+            """INSERT INTO instruments
+               (venue,inst_id,base_ccy,quote_ccy,tick_sz,lot_sz,min_sz,state)
+               VALUES ('okx-tr',$1,'BTC','USDT',0.1,0.00000001,0.00001,'live')
+               ON CONFLICT DO NOTHING RETURNING inst_id""", INST)
+    yield
+    async with pool.market().acquire() as con:
+        if inserted:
+            await con.execute("DELETE FROM instruments WHERE venue='okx-tr' AND inst_id=$1", INST)
+        await con.execute("DELETE FROM market_trades WHERE venue='test-e2e' AND run_id=$1",
+                          run_id)
 
 
 def candidate() -> SetupCandidate:

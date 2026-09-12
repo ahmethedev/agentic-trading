@@ -1,53 +1,129 @@
-import React, { useEffect, useRef } from 'react'
-import { createChart } from 'lightweight-charts'
+import React, { useEffect, useRef } from "react";
+import { createChart } from "lightweight-charts";
 
-/** Candles + the level/stop of the most recent setup, drawn from stored data. */
-export default function Chart({ candles, markers }) {
-  const box = useRef(null)
-  const chart = useRef(null)
-  const series = useRef(null)
-
+/** Real stored candles and quote volume. Setup levels are not fill markers. */
+export default function Chart({
+  candles = [],
+  markers,
+  instrument,
+  fills = [],
+  bar = "5m",
+}) {
+  const box = useRef(null),
+    api = useRef(null),
+    prices = useRef(null),
+    volume = useRef(null);
+  const fitted = useRef(null);
   useEffect(() => {
-    if (!box.current) return
-    chart.current = createChart(box.current, {
-      height: 340,
-      layout: { background: { color: 'transparent' }, textColor: '#8b97ab', fontSize: 11 },
-      grid: { vertLines: { color: '#1b2230' }, horzLines: { color: '#1b2230' } },
-      rightPriceScale: { borderColor: '#262f3f' },
-      timeScale: { borderColor: '#262f3f', timeVisible: true, secondsVisible: false },
-      crosshair: { mode: 0 },
-    })
-    series.current = chart.current.addCandlestickSeries({
-      upColor: '#26a37b', downColor: '#d0455c',
-      borderUpColor: '#26a37b', borderDownColor: '#d0455c',
-      wickUpColor: '#26a37b', wickDownColor: '#d0455c',
-    })
-    const ro = new ResizeObserver(() => {
-      if (box.current) chart.current.applyOptions({ width: box.current.clientWidth })
-    })
-    ro.observe(box.current)
-    return () => { ro.disconnect(); chart.current.remove() }
-  }, [])
-
+    const chart = createChart(box.current, {
+      height: 320,
+      layout: {
+        background: { color: "#FFFFFF" },
+        textColor: "#5F6B7A",
+        fontFamily: "IBM Plex Sans, sans-serif",
+        fontSize: 12,
+      },
+      grid: { vertLines: { visible: false }, horzLines: { color: "#EEF1F6" } },
+      rightPriceScale: {
+        borderVisible: false,
+        scaleMargins: { top: 0.08, bottom: 0.25 },
+      },
+      timeScale: {
+        borderColor: "#D8DEE8",
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      localization: { locale: "tr-TR" },
+    });
+    api.current = chart;
+    prices.current = chart.addCandlestickSeries({
+      upColor: "#11785B",
+      downColor: "#B93843",
+      borderVisible: false,
+      wickUpColor: "#11785B",
+      wickDownColor: "#B93843",
+    });
+    volume.current = chart.addHistogramSeries({
+      priceFormat: { type: "volume" },
+      priceScaleId: "volume",
+    });
+    chart
+      .priceScale("volume")
+      .applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } });
+    const ro = new ResizeObserver(() =>
+      chart.applyOptions({ width: box.current?.clientWidth || 300 }),
+    );
+    ro.observe(box.current);
+    return () => {
+      ro.disconnect();
+      chart.remove();
+      api.current = null;
+      prices.current = null;
+      volume.current = null;
+    };
+  }, []);
   useEffect(() => {
-    if (!series.current || !candles?.length) return
-    // Only closed candles carry signal; the forming one is shown but not relied on.
-    series.current.setData(candles)
-    const lines = []
-    if (markers?.level) {
-      lines.push(series.current.createPriceLine({
-        price: markers.level, color: '#4b8bf5', lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: 'level',
-      }))
+    if (!prices.current) return;
+    prices.current.setData(candles);
+    volume.current.setData(
+      candles.map((c) => ({
+        time: c.time,
+        value: c.volume,
+        color: c.close >= c.open ? "#B7D9CD" : "#E9BDC1",
+      })),
+    );
+    if (candles.length && fitted.current !== instrument) {
+      api.current.timeScale().fitContent();
+      fitted.current = instrument;
     }
-    if (markers?.stop) {
-      lines.push(series.current.createPriceLine({
-        price: markers.stop, color: '#d0455c', lineWidth: 1, lineStyle: 2,
-        axisLabelVisible: true, title: 'stop',
+    const lines = [];
+    if (markers?.level)
+      lines.push(
+        prices.current.createPriceLine({
+          price: +markers.level,
+          color: "#3159D9",
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: "Kurulum",
+        }),
+      );
+    if (markers?.stop)
+      lines.push(
+        prices.current.createPriceLine({
+          price: +markers.stop,
+          color: "#B93843",
+          lineWidth: 1,
+          lineStyle: 2,
+          axisLabelVisible: true,
+          title: "Yapısal stop",
+        }),
+      );
+    return () => lines.forEach((l) => prices.current?.removePriceLine(l));
+  }, [candles, markers?.level, markers?.stop, instrument]);
+  useEffect(() => {
+    if (!prices.current) return;
+    const seconds = { "1m": 60, "5m": 300, "15m": 900 }[bar] || 300;
+    const times = new Set(candles.map((c) => c.time));
+    const points = fills
+      .filter((f) => f.inst_id === instrument.split(":")[0])
+      .map((f) => ({
+        time: Math.floor(new Date(f.ts).getTime() / 1000 / seconds) * seconds,
+        position: f.side === "buy" ? "belowBar" : "aboveBar",
+        color: f.side === "buy" ? "#11785B" : "#B93843",
+        shape: f.side === "buy" ? "arrowUp" : "arrowDown",
+        text: f.side === "buy" ? "Alış fill" : "Satış fill",
       }))
-    }
-    return () => lines.forEach((l) => series.current?.removePriceLine(l))
-  }, [candles, markers])
-
-  return <div ref={box} style={{ width: '100%' }} />
+      .filter((f) => times.has(f.time))
+      .sort((a, b) => a.time - b.time);
+    prices.current.setMarkers(points);
+  }, [candles, fills, instrument, bar]);
+  return (
+    <div
+      ref={box}
+      role="img"
+      aria-label={`${instrument} fiyat ve hacim grafiği; sayısal özet aşağıdadır.`}
+      className="chart-canvas"
+    />
+  );
 }

@@ -13,17 +13,32 @@ _ledger_pool: asyncpg.Pool | None = None
 _market_pool: asyncpg.Pool | None = None
 
 
-async def init_pools(dsn: str) -> None:
+async def init_pools(dsn: str, *, read_only: bool = False) -> None:
     global _ledger_pool, _market_pool
+    settings = {"default_transaction_read_only": "on"} if read_only else {}
     if _ledger_pool is None:
         _ledger_pool = await asyncpg.create_pool(
-            dsn, min_size=2, max_size=8, command_timeout=10,
-            server_settings={"search_path": "at,public", "application_name": "at-ledger"},
+            dsn,
+            min_size=2,
+            max_size=8,
+            command_timeout=10,
+            server_settings={
+                **settings,
+                "search_path": "at,public",
+                "application_name": "at-ledger",
+            },
         )
     if _market_pool is None:
         _market_pool = await asyncpg.create_pool(
-            dsn, min_size=1, max_size=6, command_timeout=30,
-            server_settings={"search_path": "at,public", "application_name": "at-market"},
+            dsn,
+            min_size=1,
+            max_size=6,
+            command_timeout=30,
+            server_settings={
+                **settings,
+                "search_path": "at,public",
+                "application_name": "at-market",
+            },
         )
 
 
