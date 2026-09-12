@@ -1,8 +1,12 @@
-"""Read-only dashboard API.
+"""Dashboard API.
 
 The dashboard reads the same persistent store the worker writes; it never
 recomputes PnL or risk (AGENT.md §9). Closing the dashboard cannot affect the
 bot, and no endpoint here can place or cancel an order.
+
+Reads of the trading record are read-only at the database level. The one writing
+surface is the experiment lab under /api/product/experiments: saved rule versions
+and simulated runs, operator-session only, with no path to the venue.
 """
 
 from __future__ import annotations
@@ -32,7 +36,10 @@ DASHBOARD_DIST = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await pool.init_pools(get_settings().database_url, read_only=True)
+    # ledger + market stay read-only at the database level: no dashboard query
+    # and no chat tool can write to the trading record. The experiment lab gets
+    # its own writable pool for the strategy/experiment tables (db/pool.py).
+    await pool.init_pools(get_settings().database_url, read_only=True, product=True)
     yield
     await pool.close_pools()
 

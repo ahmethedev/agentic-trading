@@ -18,8 +18,9 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
 from ..config import get_settings
-from ..product import llm
+from ..product import experiments, llm
 from ..product.service import answer_question, market_overview, route_question, strategy, workspace
+from ..product.templates import DraftRejected
 
 log = structlog.get_logger(__name__)
 
@@ -58,6 +59,20 @@ def require_operator(request: Request):
 
 class Login(BaseModel):
     token: SecretStr
+
+
+class Draft(BaseModel):
+    """One catalogued rule change on a saved version. Never free-form JSON."""
+
+    parent_version_id: int = Field(ge=1)
+    key: str = Field(pattern=r"^(entry|exit)\.[a-z_]{3,40}$")
+    value: float | None = None
+    note: str = Field(default="", max_length=280)
+
+
+class StartExperiment(BaseModel):
+    version_id: int = Field(ge=1)
+    mode: str = Field(pattern=r"^(SHADOW|REPLAY)$")
 
 
 class Question(BaseModel):
@@ -276,6 +291,64 @@ async def get_strategy():
 async def get_workspace(request: Request):
     require_operator(request)
     return await workspace()
+
+
+# --- experiments ------------------------------------------------------------
+#
+# The only writing endpoints in the product API, and the write is narrow: a saved
+# rule version, a simulated run, or the pair that joins two runs. None of them
+# can reach the venue, the ledger or a live position, and all of them require an
+# operator session.
+
+
+@router.get("/experiments")
+async def get_experiments(request: Request):
+    require_operator(request)
+    return await experiments.overview()
+
+
+@router.post("/experiments/draft")
+async def create_draft(body: Draft, request: Request):
+    require_operator(request)
+    try:
+        return await experiments.create_draft(
+            body.parent_version_id, body.key, body.value, body.note
+        )
+    except DraftRejected as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@router.post("/experiments/start")
+async def start_experiment(body: StartExperiment, request: Request):
+    """Open the experiment, or return the one this version already has.
+
+    Idempotent by request key, so a repeated click cannot open a second run
+    (PRODUCT.md §10).
+    """
+    require_operator(request)
+    try:
+        started = await experiments.start_experiment(body.version_id, body.mode)
+        return await experiments.experiment_status(started["experiment_id"], force=True) | {
+            "created": started["created"]
+        }
+    except DraftRejected as exc:
+        raise HTTPException(400, str(exc)) from None
+
+
+@router.get("/experiments/{experiment_id}")
+async def get_experiment(experiment_id: int, request: Request):
+    require_operator(request)
+    try:
+        return await experiments.experiment_status(experiment_id)
+    except DraftRejected as exc:
+        raise HTTPException(404, str(exc)) from None
+
+
+@router.post("/experiments/runs/{exp_run_id}/stop")
+async def stop_experiment_run(exp_run_id: int, request: Request):
+    """End a shadow observation. Nothing is closed at a venue: nothing was opened."""
+    require_operator(request)
+    return await experiments.stop_run(exp_run_id)
 
 
 @router.post("/ask")

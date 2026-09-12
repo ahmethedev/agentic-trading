@@ -3,13 +3,18 @@ import Chart from "./Chart.jsx";
 import {
   askQuant,
   askQuantStream,
+  createDraft,
   getCandles,
+  getExperiment,
+  getExperiments,
   getMarket,
   getSession,
   getStrategy,
   getWorkspace,
   login,
   logout,
+  startExperiment,
+  stopExperimentRun,
 } from "./api.js";
 
 const fmt = (v, digits = 2) =>
@@ -436,8 +441,8 @@ function Chat({ selected, onNavigate, opened, onClose, assistant }) {
                       <ol className="tool-trace">
                         {m.calls.map((c, j) => (
                           <li key={j} className={c.ok ? "ok" : "failed"}>
-                            {toolLabels[c.name] || c.name} · {c.duration_ms} ms ·{" "}
-                            {c.ok ? "başarılı" : "hata"}
+                            {toolLabels[c.name] || c.name} · {c.duration_ms} ms
+                            · {c.ok ? "başarılı" : "hata"}
                           </li>
                         ))}
                       </ol>
@@ -631,6 +636,604 @@ function Connection({ session, connection, onSession, error }) {
         </p>
       </details>
     </section>
+  );
+}
+
+const modeBadge = (mode) =>
+  mode === "SHADOW" ? "SHADOW · Simülasyon" : "REPLAY · Geçmiş veri";
+const signedR = (v) =>
+  v === null || v === undefined ? "—" : `${v > 0 ? "+" : ""}${fmt(v, 3)} R`;
+
+function RuleDiff({ diff }) {
+  if (!diff?.length) return null;
+  return (
+    <ul className="rule-diff">
+      {diff.map((d) => (
+        <li key={d.key}>
+          <span>{d.label}</span>
+          <s>{d.before}</s>
+          <Icon name="arrow" width="16" height="16" />
+          <strong>{d.after}</strong>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// One simulated leg. Every figure here is simulated: the label says so once, at
+// the top, rather than being implied by its absence.
+function LegCard({ leg, kind }) {
+  const r = leg?.result;
+  if (!r) return null;
+  const open = r.open_trades > 0;
+  return (
+    <article className={`leg-card ${kind}`}>
+      <header>
+        <span className="eyebrow">
+          {kind === "baseline" ? "Baseline" : "Alternatif"}
+        </span>
+        <h3>{leg.version_label}</h3>
+        <span className={`badge ${leg.status === "RUNNING" ? "" : "muted"}`}>
+          {leg.status === "RUNNING" ? "Çalışıyor" : "Sonlandırıldı"}
+        </span>
+      </header>
+      <div className="leg-headline">
+        <div>
+          <span>Net sonuç (simüle)</span>
+          <strong className={r.net_r > 0 ? "pos" : r.net_r < 0 ? "neg" : ""}>
+            {signedR(r.net_r)}
+          </strong>
+          <small>
+            {r.closed_trades} kapanmış gözlem
+            {open ? ` · ${r.open_trades} açık (sonuç sayılmaz)` : ""}
+          </small>
+        </div>
+        <div>
+          <span>Ücret yükü</span>
+          <strong>{signedR(r.fees_r === null ? null : -r.fees_r)}</strong>
+          <small>Brüt {signedR(r.gross_r)}</small>
+        </div>
+      </div>
+      <dl className="leg-grid">
+        <dt>Kaydedilen aday</dt>
+        <dd>{r.candidates_seen}</dd>
+        <dt>Kuralı geçen</dt>
+        <dd>{r.entries_qualified}</dd>
+        <dt>Girilen</dt>
+        <dd>{r.entries_taken}</dd>
+        <dt>Pozisyon doluyken atlanan</dt>
+        <dd>{r.entries_skipped_busy}</dd>
+        <dt>Kazanan / kaybeden</dt>
+        <dd>
+          {r.winners} / {r.losers}
+        </dd>
+        <dt>Belirsiz mum</dt>
+        <dd>{r.ambiguous_trades}</dd>
+      </dl>
+      {r.trades?.length ? (
+        <details className="leg-trades">
+          <summary>Simüle işlemler ({r.trades.length})</summary>
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>Parite</th>
+                  <th>Giriş</th>
+                  <th>Sonuç</th>
+                  <th>Çıkış bacakları</th>
+                </tr>
+              </thead>
+              <tbody>
+                {r.trades.map((t) => (
+                  <tr key={t.decision_id}>
+                    <td>
+                      {t.inst_id}
+                      <small className="fine"> · karar #{t.decision_id}</small>
+                    </td>
+                    <td>
+                      {fmt(t.entry_px, 4)}
+                      <small className="fine"> · {stamp(t.entry_at)}</small>
+                    </td>
+                    <td
+                      className={
+                        t.net_r > 0 ? "pos" : t.net_r < 0 ? "neg" : undefined
+                      }
+                    >
+                      {t.status === "CLOSED" ? (
+                        signedR(t.net_r)
+                      ) : (
+                        <span className="warn-note">Açık · sonuç yok</span>
+                      )}
+                      {t.ambiguous && (
+                        <small className="fine"> · belirsiz mum</small>
+                      )}
+                    </td>
+                    <td>
+                      {t.legs.length
+                        ? t.legs
+                            .map(
+                              (l) =>
+                                `${
+                                  {
+                                    tp1: "1. hedef",
+                                    tp2: "2. hedef",
+                                    stop: "stop",
+                                    stop_ambiguous: "stop (belirsiz)",
+                                    time: "süre sonu",
+                                  }[l.reason] || l.reason
+                                } ${signedR(l.r_multiple)}`,
+                            )
+                            .join(" · ")
+                        : "Henüz çıkış yok"}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      ) : (
+        <p className="fine">
+          Bu kolda henüz giriş yok. Gölge çalışma, başlatıldıktan sonra
+          kaydedilen adayları izler.
+        </p>
+      )}
+    </article>
+  );
+}
+
+function ExperimentDetail({ detail, onStop, onRefresh, busy }) {
+  const c = detail.comparison;
+  const assumptions = detail.baseline.assumptions || {};
+  const running = detail.baseline.status === "RUNNING";
+  return (
+    <section className="panel experiment-detail">
+      <div className="section-head">
+        <div>
+          <span className="eyebrow">Deney #{detail.experiment_id}</span>
+          <h2>{detail.title}</h2>
+        </div>
+        <span className={`badge ${detail.mode === "SHADOW" ? "shadow" : ""}`}>
+          {modeBadge(detail.mode)}
+        </span>
+      </div>
+      <div className={`verdict ${c.state}`} role="status">
+        <strong>
+          {c.state === "insufficient_evidence"
+            ? "Kanıt yetersiz"
+            : c.state === "no_difference"
+              ? "Fark yok"
+              : "Fark gözlendi"}
+        </strong>
+        <p>{c.headline}</p>
+        {c.net_r_delta !== null && (
+          <p className="fine">
+            Net fark {signedR(c.net_r_delta)} · ortak giriş {c.shared_entries} ·
+            yalnız baseline {c.only_baseline_entries.length} · yalnız alternatif{" "}
+            {c.only_variant_entries.length}
+          </p>
+        )}
+      </div>
+      <div className="leg-pair">
+        <LegCard leg={detail.baseline} kind="baseline" />
+        <LegCard leg={detail.variant} kind="variant" />
+      </div>
+      <div className="experiment-meta">
+        <dl>
+          <dt>Yöntem</dt>
+          <dd>{c.method}</dd>
+          <dt>Dönem</dt>
+          <dd>
+            {stamp(detail.baseline.window_from)} —{" "}
+            {detail.baseline.window_to
+              ? stamp(detail.baseline.window_to)
+              : "açık (gözlem sürüyor)"}
+          </dd>
+          <dt>Veri çözünürlüğü</dt>
+          <dd>{assumptions.resolution_note}</dd>
+          <dt>Maliyet varsayımı</dt>
+          <dd>
+            Taker {fmt(+assumptions.taker_fee_rate * 10000, 1)} bp · slippage{" "}
+            {fmt(assumptions.slippage_bps, 1)} bp · simüle sermaye{" "}
+            {fmt(assumptions.equity_quote)} USDT. {assumptions.fee_note}
+          </dd>
+          <dt>Son değerlendirme</dt>
+          <dd>
+            {stamp(detail.baseline.last_evaluated_at)}
+            {assumptions.window_note ? ` · ${assumptions.window_note}` : ""}
+          </dd>
+        </dl>
+        <ul className="fine">
+          {c.limits.map((l) => (
+            <li key={l}>{l}</li>
+          ))}
+        </ul>
+      </div>
+      <div className="experiment-controls">
+        <button
+          className="secondary"
+          disabled={busy === "refresh"}
+          onClick={onRefresh}
+        >
+          {busy === "refresh" ? "Kontrol ediliyor…" : "Durumu kontrol et"}
+        </button>
+        {running && (
+          <button
+            className="danger-outline"
+            disabled={busy === "stop"}
+            onClick={onStop}
+          >
+            {busy === "stop" ? "Sonlandırılıyor…" : "Gölge çalışmayı sonlandır"}
+          </button>
+        )}
+        <span className="fine">
+          Bu çalışma borsaya emir göndermez ve canlı bakiyeyi kullanmaz.
+          Sonlandırmak canlı pozisyon kapatmaz.
+        </span>
+      </div>
+    </section>
+  );
+}
+
+function DraftForm({ baseline, catalogue, onCreate, busy, onAsk }) {
+  const [key, setKey] = useState("exit.breakeven_r");
+  const [value, setValue] = useState("");
+  const [off, setOff] = useState(false);
+  const rule = catalogue.find((c) => c.key === key);
+  useEffect(() => {
+    setValue(rule?.current ?? "");
+    setOff(rule?.current === null);
+  }, [key]);
+  const sections = ["Çıkış kuralı", "Giriş kuralı"];
+  return (
+    <form
+      className="draft-form"
+      onSubmit={(e) => {
+        e.preventDefault();
+        onCreate(baseline.version_id, key, off ? null : Number(value));
+      }}
+    >
+      <div className="draft-fields">
+        <label htmlFor="rule">
+          Değiştirilecek kural
+          <select
+            id="rule"
+            value={key}
+            onChange={(e) => setKey(e.target.value)}
+          >
+            {sections.map((s) => (
+              <optgroup key={s} label={s}>
+                {catalogue
+                  .filter((c) => c.section === s)
+                  .map((c) => (
+                    <option key={c.key} value={c.key}>
+                      {c.label}
+                    </option>
+                  ))}
+              </optgroup>
+            ))}
+          </select>
+        </label>
+        <label htmlFor="value">
+          Yeni değer
+          <input
+            id="value"
+            type="number"
+            inputMode="decimal"
+            value={off ? "" : value}
+            disabled={off}
+            min={rule?.minimum ?? undefined}
+            max={rule?.maximum ?? undefined}
+            step={rule?.step ?? "any"}
+            onChange={(e) => setValue(e.target.value)}
+            required={!off}
+          />
+        </label>
+      </div>
+      <p className="fine">
+        {rule?.help} Şu anki değer: <strong>{rule?.current_label}</strong>
+        {rule?.minimum !== null && rule?.maximum !== null
+          ? ` · izinli aralık ${fmt(rule?.minimum, 2)} – ${fmt(rule?.maximum, 2)}`
+          : ""}
+      </p>
+      {rule?.nullable && (
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={off}
+            onChange={(e) => setOff(e.target.checked)}
+          />
+          {rule.null_label}
+        </label>
+      )}
+      <div className="draft-actions">
+        <button className="primary" disabled={busy === "draft"}>
+          {busy === "draft" ? "Taslak kaydediliyor…" : "Taslağı kaydet"}
+        </button>
+        <button
+          type="button"
+          className="text-button"
+          onClick={() => onAsk("1R'da stop'u entry'ye çekmeseydik ne olurdu?")}
+        >
+          Quant'a sor <Icon name="arrow" />
+        </button>
+      </div>
+      <p className="fine">
+        Taslak kaydetmek çalışma başlatmaz. Tek seferde tek kural değişir; iki
+        kural birden değişirse sonucun hangisinden geldiği söylenemez.
+      </p>
+    </form>
+  );
+}
+
+function Experiments({ session, onConnect, onAsk }) {
+  const [data, setData] = useState(null);
+  const [detail, setDetail] = useState(null);
+  const [selected, setSelected] = useState(null);
+  const [busy, setBusy] = useState("");
+  const [error, setError] = useState("");
+  const authenticated = session?.authenticated;
+
+  async function load() {
+    try {
+      const overview = await getExperiments();
+      setData(overview);
+      setError("");
+      if (!selected && overview.experiments.length)
+        setSelected(overview.experiments[0].experiment_id);
+    } catch (e) {
+      setError(e.message);
+    }
+  }
+  useEffect(() => {
+    if (authenticated) load();
+  }, [authenticated]);
+  // The result is a snapshot of a deterministic replay, so polling shows a
+  // shadow run picking up candidates as new candles close.
+  useEffect(() => {
+    if (!selected) return;
+    let active = true,
+      timer;
+    async function poll() {
+      try {
+        const d = await getExperiment(selected);
+        if (active) {
+          setDetail(d);
+          setError("");
+        }
+      } catch (e) {
+        if (active) setError(e.message);
+      }
+      if (active) timer = setTimeout(poll, 20000);
+    }
+    poll();
+    return () => {
+      active = false;
+      clearTimeout(timer);
+    };
+  }, [selected]);
+
+  async function createDraftVersion(parent, key, value) {
+    setBusy("draft");
+    setError("");
+    try {
+      await createDraft(parent, key, value);
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+  async function start(versionId, mode) {
+    setBusy(`start:${versionId}:${mode}`);
+    setError("");
+    try {
+      const started = await startExperiment(versionId, mode);
+      setDetail(started);
+      setSelected(started.experiment_id);
+      await load();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+  async function refresh() {
+    setBusy("refresh");
+    try {
+      setDetail(await getExperiment(selected));
+      setError("");
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+  async function stopShadow() {
+    setBusy("stop");
+    try {
+      await stopExperimentRun(detail.baseline.exp_run_id);
+      await stopExperimentRun(detail.variant.exp_run_id);
+      setDetail(await getExperiment(selected));
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy("");
+    }
+  }
+
+  if (!authenticated)
+    return (
+      <section className="panel experiment-empty">
+        <div className="large-icon">
+          <Icon name="experiment" width="32" height="32" />
+        </div>
+        <h2>Deneyler kendi kayıtlarını okur.</h2>
+        <p>
+          Baseline ile alternatifi karşılaştırmak için stratejinin karar
+          kayıtlarına erişim gerekir. Operatör oturumunu aç.
+        </p>
+        <button className="primary" onClick={onConnect}>
+          Operatör oturumunu aç <Icon name="arrow" />
+        </button>
+      </section>
+    );
+  if (!data)
+    return (
+      <section className="panel">
+        <Empty
+          title={error ? "Deney servisi okunamadı" : "Deneyler yükleniyor"}
+        >
+          {error || "Kayıtlı sürümler ve çalışmalar getiriliyor."}
+        </Empty>
+      </section>
+    );
+
+  const drafts = data.versions.filter((v) => !v.is_baseline);
+  return (
+    <>
+      {error && (
+        <div className="error" role="alert">
+          {error}
+        </div>
+      )}
+      <section className="panel experiment-intro">
+        <div className="experiment-steps">
+          <span>01 · Kuralı değiştir</span>
+          <span>02 · Gölge/replay çalıştır</span>
+          <span>03 · Kanıtı karşılaştır</span>
+        </div>
+        <h2>Bir değişiklik. Bir deney.</h2>
+        <p>
+          Başlangıç stratejisini kopyala, tek kuralı değiştir ve iki kolu aynı
+          kayıtlar üzerinde, sermaye ayırmadan karşılaştır.
+        </p>
+        <div className="baseline-strip">
+          <div>
+            <span className="eyebrow">Baseline sürüm</span>
+            <strong>{data.baseline.label}</strong>
+          </div>
+          <details>
+            <summary>Kuralları gör</summary>
+            <ol className="rules">
+              {data.baseline.rules.map((r) => (
+                <li key={r}>{r}</li>
+              ))}
+            </ol>
+          </details>
+        </div>
+        <DraftForm
+          baseline={data.baseline}
+          catalogue={data.catalogue}
+          onCreate={createDraftVersion}
+          busy={busy}
+          onAsk={onAsk}
+        />
+      </section>
+
+      <section className="panel">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">Taslak sürümler</span>
+            <h2>Neyi denemek istiyorsun?</h2>
+          </div>
+        </div>
+        {drafts.length ? (
+          <div className="draft-list">
+            {drafts.map((v) => (
+              <article key={v.version_id} className="draft-card">
+                <header>
+                  <div>
+                    <strong>{v.label}</strong>
+                    <small className="fine">
+                      Sürüm #{v.version_id} · {stamp(v.created_at)}
+                    </small>
+                  </div>
+                  <span className="badge muted">Taslak</span>
+                </header>
+                <RuleDiff diff={v.diff} />
+                <div className="draft-actions">
+                  <button
+                    className="primary"
+                    disabled={busy.startsWith("start")}
+                    onClick={() => start(v.version_id, "SHADOW")}
+                  >
+                    {busy === `start:${v.version_id}:SHADOW`
+                      ? "Başlatılıyor…"
+                      : "Gölge çalıştır"}
+                  </button>
+                  <button
+                    className="secondary"
+                    disabled={busy.startsWith("start")}
+                    onClick={() => start(v.version_id, "REPLAY")}
+                  >
+                    {busy === `start:${v.version_id}:REPLAY`
+                      ? "Başlatılıyor…"
+                      : "Kayıtlı dönemde dene"}
+                  </button>
+                  <details className="draft-rules">
+                    <summary>Bu sürümün kuralları</summary>
+                    <ol className="rules">
+                      {v.rules.map((r) => (
+                        <li key={r}>{r}</li>
+                      ))}
+                    </ol>
+                  </details>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <Empty title="Henüz taslak yok">
+            Yukarıdan bir kuralı değiştirerek ilk alternatifini oluştur.
+          </Empty>
+        )}
+        <p className="fine">
+          Gölge, başlatıldıktan sonra kaydedilen adayları izler. Kayıtlı dönem,
+          arşivde duran son {48} saati yeniden değerlendirir; ikisi aynı şey
+          değildir ve ayrı etiketlenir.
+        </p>
+      </section>
+
+      {data.experiments.length > 0 && (
+        <section className="panel">
+          <div className="section-head">
+            <div>
+              <span className="eyebrow">Çalışmalar</span>
+              <h2>Başlatılan deneyler</h2>
+            </div>
+          </div>
+          <div className="experiment-list">
+            {data.experiments.map((e) => (
+              <button
+                key={e.experiment_id}
+                className={selected === e.experiment_id ? "selected" : ""}
+                onClick={() => setSelected(e.experiment_id)}
+              >
+                <strong>{e.title}</strong>
+                <span className="badge">{modeBadge(e.mode)}</span>
+                <small>
+                  #{e.experiment_id} · {stamp(e.created_at)} ·{" "}
+                  {e.variant_status === "RUNNING"
+                    ? "çalışıyor"
+                    : "sonlandırıldı"}
+                </small>
+              </button>
+            ))}
+          </div>
+        </section>
+      )}
+
+      {detail && detail.experiment_id === selected && (
+        <ExperimentDetail
+          detail={detail}
+          busy={busy}
+          onRefresh={refresh}
+          onStop={stopShadow}
+        />
+      )}
+    </>
   );
 }
 
@@ -1110,42 +1713,29 @@ export default function App() {
                 <section className="panel">
                   <h2>Bir fikri deneye dönüştür</h2>
                   <p>
-                    Bir sonraki teslim: desteklenen şablondan taslak oluşturma,
-                    tek kuralı değiştirme ve ayrı sürüm kaydetme.
+                    Bu stratejiyi kopyala, desteklenen tek bir kuralı değiştir
+                    ve alternatifi gölge modda izle. Taslak ayrı bir sürüm
+                    olarak kaydedilir.
                   </p>
+                  <button
+                    className="primary"
+                    onClick={() => setView("experiments")}
+                  >
+                    Deneyler ekranını aç <Icon name="arrow" />
+                  </button>
                   <div className="callout">
-                    Taslak editörü ve gölge başlatma henüz uygulanmadı. Aktif
-                    strateji bu görünümden değiştirilemez.
+                    Taslak kaydetmek ve gölge çalıştırmak aktif canlı sürümü,
+                    açık pozisyonu veya borsadaki emirleri değiştirmez.
                   </div>
                 </section>
               </>
             )}
             {view === "experiments" && (
-              <section className="panel experiment-empty">
-                <div className="large-icon">
-                  <Icon name="experiment" width="32" height="32" />
-                </div>
-                <h2>İlk deneyin için yer hazır.</h2>
-                <p>
-                  Baseline ile tek kuralı değişen alternatifi, sermaye ayırmadan
-                  karşılaştıracağız.
-                </p>
-                <div className="experiment-steps">
-                  <span>01 · Kuralı seç</span>
-                  <span>02 · Gölge izle</span>
-                  <span>03 · Kanıtı karşılaştır</span>
-                </div>
-                <p className="callout">
-                  Gölge evaluator bu teslimde bağlı değil. Çalışma veya simüle
-                  sonuç üretilmedi.
-                </p>
-                <button
-                  className="secondary"
-                  onClick={() => setView("strategies")}
-                >
-                  Başlangıç kurallarını incele <Icon name="arrow" />
-                </button>
-              </section>
+              <Experiments
+                session={session}
+                onConnect={() => setView("connection")}
+                onAsk={ask}
+              />
             )}
             {view === "connection" && (
               <Connection

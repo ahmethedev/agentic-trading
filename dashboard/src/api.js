@@ -1,9 +1,12 @@
 export async function request(path, options = {}) {
+  // Simulating both legs of an experiment reads a window of candles, so those
+  // calls get a longer budget than a dashboard poll.
+  const { timeout = 15000, ...init } = options;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15000);
+  const timer = setTimeout(() => controller.abort(), timeout);
   try {
     const response = await fetch(path, {
-      ...options,
+      ...init,
       signal: controller.signal,
       credentials: "same-origin",
     });
@@ -92,3 +95,28 @@ export const login = (token) =>
   });
 export const logout = () =>
   request("/api/product/session", { method: "DELETE" });
+
+// --- experiments ------------------------------------------------------------
+// The only writing calls in the app. They create a saved rule version or a
+// simulated run; none of them can reach the venue.
+export const getExperiments = () => request("/api/product/experiments");
+export const createDraft = (parent_version_id, key, value, note = "") =>
+  request("/api/product/experiments/draft", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ parent_version_id, key, value, note }),
+  });
+export const startExperiment = (version_id, mode) =>
+  request("/api/product/experiments/start", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ version_id, mode }),
+    timeout: 45000,
+  });
+export const getExperiment = (id) =>
+  request(`/api/product/experiments/${id}`, { timeout: 45000 });
+export const stopExperimentRun = (id) =>
+  request(`/api/product/experiments/runs/${id}/stop`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+  });

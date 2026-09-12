@@ -270,3 +270,74 @@ CREATE TABLE IF NOT EXISTS ops_events (
     detail      JSONB NOT NULL DEFAULT '{}'
 );
 CREATE INDEX IF NOT EXISTS ops_recent ON ops_events (ts DESC);
+
+-- ------------------------------------------------- strategy versions & labs --
+-- The product side of the system: a trader's own rules, the single-change
+-- variants built from them, and the simulated runs that compare the two.
+-- Deliberately separate from the tables above: nothing here can produce an
+-- order. A shadow/replay run reads the recorded decision + candle archive and
+-- writes only its own result snapshot (PRODUCT.md §6, §8).
+
+CREATE TABLE IF NOT EXISTS strategies (
+    strategy_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    slug          TEXT NOT NULL UNIQUE,      -- stable handle, e.g. 'reclaim'
+    name          TEXT NOT NULL,
+    idea          TEXT NOT NULL DEFAULT '',
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- One immutable row per saved rule set. A run binds to a version_id, so the
+-- rules a result was produced under can never be edited out from under it.
+CREATE TABLE IF NOT EXISTS strategy_versions (
+    version_id        BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    strategy_id       BIGINT NOT NULL REFERENCES strategies(strategy_id),
+    parent_version_id BIGINT REFERENCES strategy_versions(version_id),
+    label             TEXT NOT NULL,
+    template          TEXT NOT NULL,         -- supported template id
+    params            JSONB NOT NULL,        -- fully resolved entry+exit params
+    changed_field     TEXT,                  -- the one edited field; NULL = baseline
+    changed_from      TEXT,
+    changed_to        TEXT,
+    change_note       TEXT NOT NULL DEFAULT '',
+    is_baseline       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (strategy_id, label)
+);
+CREATE INDEX IF NOT EXISTS strategy_versions_by_strategy
+    ON strategy_versions (strategy_id, created_at DESC);
+
+-- A simulated run of one version. SHADOW observes candidates recorded AFTER it
+-- was started; REPLAY re-reads a window that has already been recorded. Neither
+-- ever reaches the venue, and neither consumes live balance: each run carries
+-- its own simulated inventory inside `result`.
+CREATE TABLE IF NOT EXISTS experiment_runs (
+    exp_run_id     BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    version_id     BIGINT NOT NULL REFERENCES strategy_versions(version_id),
+    mode           TEXT NOT NULL CHECK (mode IN ('SHADOW','REPLAY')),
+    status         TEXT NOT NULL CHECK (status IN ('RUNNING','STOPPED')),
+    -- Idempotency: a repeated start request returns the existing run instead of
+    -- opening a second one (PRODUCT.md §10).
+    request_key    TEXT NOT NULL UNIQUE,
+    window_from    TIMESTAMPTZ NOT NULL,
+    window_to      TIMESTAMPTZ,              -- NULL = open ended (shadow)
+    assumptions    JSONB NOT NULL,           -- fees, slippage, resolution, equity
+    result         JSONB,                    -- last evaluation snapshot
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_evaluated_at TIMESTAMPTZ,
+    stopped_at     TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS experiment_runs_recent ON experiment_runs (created_at DESC);
+
+-- The pairing that makes a comparison honest: both legs are simulated runs over
+-- the same window with the same assumptions, never a simulated leg measured
+-- against the live ledger.
+CREATE TABLE IF NOT EXISTS experiments (
+    experiment_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    title           TEXT NOT NULL,
+    baseline_run_id BIGINT NOT NULL REFERENCES experiment_runs(exp_run_id),
+    variant_run_id  BIGINT NOT NULL REFERENCES experiment_runs(exp_run_id),
+    changed_field   TEXT NOT NULL,
+    method          TEXT NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (baseline_run_id, variant_run_id)
+);
