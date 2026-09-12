@@ -19,6 +19,7 @@ from decimal import Decimal
 
 import structlog
 
+from . import __version__
 from .atk.client import AtkClient, AtkError, AtkTimeout
 from .config import Settings, get_settings
 from .db import pool
@@ -83,7 +84,7 @@ class Worker:
             self._run_id = await con.fetchval(
                 """INSERT INTO runs (mode, site, demo, policy_version, code_version, notes)
                    VALUES ($1,$2,$3,$4,$5,$6) RETURNING run_id""",
-                s.mode, s.okx_site, s.okx_demo, POLICY_VERSION, "0.1.0",
+                s.mode, s.okx_site, s.okx_demo, POLICY_VERSION, __version__,
                 json.dumps({"instruments": self._instruments,
                             "authenticated": s.has_credentials,
                             "max_entries_per_run": s.max_entries_per_run,

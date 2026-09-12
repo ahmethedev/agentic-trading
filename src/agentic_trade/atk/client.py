@@ -20,6 +20,8 @@ from typing import Any
 
 import structlog
 
+from .. import __version__
+
 log = structlog.get_logger(__name__)
 
 # --- Allowlist ---------------------------------------------------------------
@@ -155,7 +157,7 @@ class AtkClient:
             {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "agentic-trade", "version": "0.1.0"},
+                "clientInfo": {"name": "agentic-trade", "version": __version__},
             },
         )
         self._server_info = init.get("serverInfo", {})

@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
+from .. import __version__
 from ..config import get_settings
 from ..db import pool
 from .product import ALLOWED_ORIGINS, authorised
@@ -44,7 +45,7 @@ async def lifespan(app: FastAPI):
     await pool.close_pools()
 
 
-app = FastAPI(title="ThatsMyQuant", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="ThatsMyQuant", version=__version__, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware, allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_methods=["GET", "POST", "DELETE"], allow_credentials=True, allow_headers=["*"],
