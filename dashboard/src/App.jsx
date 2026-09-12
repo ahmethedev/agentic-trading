@@ -4,6 +4,7 @@ import {
   askQuant,
   askQuantStream,
   createDraft,
+  getBacktest,
   getCandles,
   getExperiment,
   getExperiments,
@@ -42,6 +43,7 @@ const modeLabel = (run) =>
 const views = [
   { id: "overview", name: "Genel bakış", icon: "overview" },
   { id: "strategies", name: "Stratejiler", icon: "strategy" },
+  { id: "backtest", name: "Backtest", icon: "backtest" },
   { id: "experiments", name: "Deneyler", icon: "experiment" },
 ];
 const toolLabels = {
@@ -77,6 +79,12 @@ function Icon({ name, ...props }) {
     experiment: (
       <>
         <path d="M9 3h6M10 3v7l-6 9q-1 2 2 2h12q3 0 2-2l-6-9V3M7 15h10" />
+      </>
+    ),
+    backtest: (
+      <>
+        <path d="M4 19V5M4 19h16" />
+        <path d="m7 15 4-4 3 2 5-6" />
       </>
     ),
     link: (
@@ -643,6 +651,161 @@ const modeBadge = (mode) =>
   mode === "SHADOW" ? "SHADOW · Simülasyon" : "REPLAY · Geçmiş veri";
 const signedR = (v) =>
   v === null || v === undefined ? "—" : `${v > 0 ? "+" : ""}${fmt(v, 3)} R`;
+
+function EquityCurve({ points = [] }) {
+  if (!points.length)
+    return (
+      <Empty title="Henüz kapanmış işlem yok">
+        Equity curve ilk simüle işlem kapandığında oluşacak.
+      </Empty>
+    );
+  const series = [{ return_pct: 0 }, ...points];
+  const values = series.map((p) => +p.return_pct || 0);
+  const low = Math.min(...values, 0);
+  const high = Math.max(...values, 0);
+  const spread = Math.max(high - low, 0.01);
+  const x = (i) => 24 + (i / Math.max(series.length - 1, 1)) * 752;
+  const y = (v) => 190 - ((v - low) / spread) * 150;
+  const line = series.map((p, i) => `${x(i)},${y(+p.return_pct || 0)}`).join(" ");
+  const zeroY = y(0);
+  return (
+    <div className="equity-chart">
+      <svg viewBox="0 0 800 220" role="img" aria-label="Simüle kümülatif getiri eğrisi">
+        <line x1="24" y1={zeroY} x2="776" y2={zeroY} className="zero-line" />
+        <polyline points={line} className="equity-line" />
+        <text x="24" y="212">0%</text>
+        <text x="776" y="212" textAnchor="end">
+          {fmt(values.at(-1), 3)}%
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+function Backtest({ session, onConnect }) {
+  const [hours, setHours] = useState(48);
+  const [report, setReport] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    if (!session?.authenticated) return;
+    let active = true;
+    setBusy(true);
+    getBacktest(hours)
+      .then((data) => {
+        if (active) {
+          setReport(data);
+          setError("");
+        }
+      })
+      .catch((e) => active && setError(e.message))
+      .finally(() => active && setBusy(false));
+    return () => {
+      active = false;
+    };
+  }, [hours, session?.authenticated]);
+
+  if (!session?.authenticated)
+    return (
+      <section className="panel experiment-empty">
+        <div className="large-icon"><Icon name="backtest" width="32" height="32" /></div>
+        <h2>Backtest kayıtlı adayları okur.</h2>
+        <p>Geçmiş simülasyonu görmek için operatör oturumunu aç.</p>
+        <button className="primary" onClick={onConnect}>Operatör oturumunu aç</button>
+      </section>
+    );
+  if (!report)
+    return (
+      <section className="panel">
+        <Empty title={error ? "Backtest çalışmadı" : "Backtest hesaplanıyor"}>
+          {error || "Kayıtlı adaylar ve 5 dakikalık mumlar yürütülüyor."}
+        </Empty>
+      </section>
+    );
+
+  const m = report.metrics;
+  const result = report.result;
+  const closed = result.trades
+    .filter((trade) => trade.status === "CLOSED")
+    .sort((a, b) => new Date(b.closed_at) - new Date(a.closed_at));
+  return (
+    <>
+      <section className="panel backtest-hero">
+        <div className="section-head">
+          <div>
+            <span className="eyebrow">{report.policy_version}</span>
+            <h2>Geçmiş performans özeti</h2>
+          </div>
+          <div className="range-buttons" role="group" aria-label="Backtest dönemi">
+            {[12, 24, 48].map((value) => (
+              <button
+                key={value}
+                className={hours === value ? "selected" : ""}
+                onClick={() => setHours(value)}
+                disabled={busy}
+              >
+                {value} saat
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className={`backtest-return ${m.net_return_pct >= 0 ? "pos" : "neg"}`}>
+          <span>Net simüle getiri</span>
+          <strong>{m.net_return_pct > 0 ? "+" : ""}{fmt(m.net_return_pct, 3)}%</strong>
+          <small>{signedR(m.net_r)} · {m.closed_trades} kapanmış işlem</small>
+        </div>
+        <p className="fine">
+          {stamp(report.window.from)} — {stamp(report.window.to)} · {report.coverage.candidate_episodes} setup
+          episode’u · {report.coverage.instruments.length} parite
+        </p>
+      </section>
+
+      <div className="metrics backtest-metrics">
+        <Metric label="Kazanma oranı" value={fmt(m.win_rate_pct, 1)} unit="%" detail={`${result.winners} kazanan · ${result.losers} kaybeden`} />
+        <Metric label="Profit factor" value={m.profit_factor_infinite ? "∞" : fmt(m.profit_factor, 2)} detail="Brüt kazanç / brüt kayıp" />
+        <Metric label="Max drawdown" value={fmt(m.max_drawdown_pct, 3)} unit="%" detail="Kapanmış işlemler üzerinden" />
+        <Metric label="Ortalama işlem" value={signedR(m.average_trade_r)} detail={`${result.open_trades} açık gözlem sonuca dahil değil`} />
+      </div>
+
+      <section className="panel">
+        <div className="section-head">
+          <div><span className="eyebrow">Equity curve</span><h2>Kümülatif yüzde getiri</h2></div>
+          <span className="badge">Simülasyon</span>
+        </div>
+        <EquityCurve points={m.equity_curve} />
+      </section>
+
+      <section className="panel">
+        <div className="section-head">
+          <div><span className="eyebrow">İşlem dökümü</span><h2>Geçmiş sinyaller</h2></div>
+          <span className="badge">{closed.length} kapanmış</span>
+        </div>
+        {closed.length ? (
+          <div className="table-scroll">
+            <table>
+              <thead><tr><th>Parite</th><th>Giriş</th><th>Çıkış</th><th>Net sonuç</th><th>Durum</th></tr></thead>
+              <tbody>
+                {closed.map((trade) => (
+                  <tr key={trade.decision_id}>
+                    <td>{trade.inst_id}</td>
+                    <td>{fmt(trade.entry_px, 5)}<small className="fine"> · {stamp(trade.entry_at)}</small></td>
+                    <td>{stamp(trade.closed_at)}</td>
+                    <td className={trade.net_r > 0 ? "pos" : trade.net_r < 0 ? "neg" : ""}>{signedR(trade.net_r)}</td>
+                    <td>{trade.ambiguous ? "Belirsiz mum · stop" : trade.legs.at(-1)?.reason || "—"}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : <Empty title="Kapanmış işlem yok">Seçilen dönemde sonuçlanmış simüle işlem bulunamadı.</Empty>}
+        <ul className="fine backtest-limits">
+          {report.limits.map((limit) => <li key={limit}>{limit}</li>)}
+        </ul>
+      </section>
+    </>
+  );
+}
 
 function RuleDiff({ diff }) {
   if (!diff?.length) return null;
@@ -1251,6 +1414,7 @@ export default function App() {
     [chartError, setChartError] = useState(""),
     [chatOpen, setChatOpen] = useState(false);
   const chatButton = useRef(null);
+  const chartRequest = useRef(0);
   async function refreshSession() {
     const s = await getSession();
     setSession(s);
@@ -1311,12 +1475,13 @@ export default function App() {
   useEffect(() => {
     let active = true,
       timer;
+    const requestId = ++chartRequest.current;
     setCandles([]);
     setChartError("");
     async function poll() {
       try {
         const c = await getCandles(selected, bar);
-        if (active) {
+        if (active && requestId === chartRequest.current) {
           setCandles(c);
           setChartError("");
         }
@@ -1431,6 +1596,8 @@ export default function App() {
                     ? "Önce anla. Sonra karar ver."
                     : view === "strategies"
                       ? "Kuralların, açık ve ölçülebilir."
+                      : view === "backtest"
+                        ? "Geçmişi ölç. Sonucu göster."
                       : view === "experiments"
                         ? "Bir değişiklik. Bir deney."
                         : "Güvenilir bir bağlantı."}
@@ -1481,7 +1648,7 @@ export default function App() {
                     label="Göreli hacim"
                     value={fmt(current?.features?.rvol)}
                     unit="×"
-                    detail={`5m kapanış · Teyit eşiği 1,30${current?.decision_stale ? " · Ölçüm eski" : ""}`}
+                    detail={`5m kapanış · Teyit eşiği ${fmt(strategy?.params?.min_rvol, 2)}${current?.decision_stale ? " · Ölçüm eski" : ""}`}
                   />
                   <Metric
                     label="Açık risk baz tutarı"
@@ -1559,6 +1726,7 @@ export default function App() {
                     </p>
                   )}
                   <Chart
+                    key={`${selected}:${bar}`}
                     candles={candles}
                     fills={ledger?.fills}
                     bar={bar}
@@ -1729,6 +1897,12 @@ export default function App() {
                   </div>
                 </section>
               </>
+            )}
+            {view === "backtest" && (
+              <Backtest
+                session={session}
+                onConnect={() => setView("connection")}
+              />
             )}
             {view === "experiments" && (
               <Experiments

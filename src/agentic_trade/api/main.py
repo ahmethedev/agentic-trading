@@ -140,6 +140,8 @@ async def status() -> dict[str, Any]:
         ),
         "risk_fraction": str(s.risk_fraction),
         "risk_fraction_max": str(s.risk_fraction_max),
+        "max_concurrent_positions": s.max_concurrent_positions,
+        "max_position_fraction": str(s.max_position_fraction),
         "gaps_last_hour": gaps,
         "reconcile": (
             {"ts": recon["ts"].isoformat(), **_j(recon["detail"])}

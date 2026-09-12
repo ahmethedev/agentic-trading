@@ -237,14 +237,22 @@ def simulate_trade(
     exit_rules: dict[str, Any],
     assumptions: Assumptions,
     risk_budget: Decimal,
+    max_position_fraction: Decimal = Decimal("1"),
 ) -> Trade:
     """Walk one entry forward through closed candles under this exit plan."""
     slip = assumptions.slippage_bps / Decimal(10000)
     entry_px = candidate.entry_reference * (1 + slip)
     stop_px = candidate.structural_stop
     price_r = entry_px - stop_px
-    qty = risk_budget / price_r if price_r > 0 else Decimal(0)
     fee = assumptions.taker_fee_rate
+    qty_by_risk = risk_budget / price_r if price_r > 0 else Decimal(0)
+    allocation = assumptions.equity_quote * max_position_fraction
+    qty_by_allocation = (
+        allocation / (entry_px * (Decimal(1) + fee))
+        if entry_px > 0
+        else Decimal(0)
+    )
+    qty = min(qty_by_risk, qty_by_allocation)
     trade = Trade(
         candidate=candidate,
         entry_px=entry_px,
@@ -341,14 +349,19 @@ def run_leg(
     """Simulate one version end to end, with its own inventory and cash."""
     now = now or datetime.now(UTC)
     risk_budget = assumptions.equity_quote * Decimal(str(params["risk"]["risk_fraction"]))
+    max_position_fraction = Decimal(
+        str(params["risk"].get("max_position_fraction") or 1)
+    )
     entries = entries_for(candidates, params["entry"])
     max_concurrent = int(params["risk"].get("max_concurrent_positions") or 1)
 
     taken: list[Trade] = []
     skipped: list[dict[str, Any]] = []
-    free_at: datetime | None = None
+    active_until: list[datetime] = []
     for candidate in entries:
-        if max_concurrent <= 1 and free_at is not None and candidate.entry_at < free_at:
+        active_until = [closed_at for closed_at in active_until
+                        if candidate.entry_at < closed_at]
+        if len(active_until) >= max_concurrent:
             skipped.append(
                 {
                     "decision_id": candidate.decision_id,
@@ -359,10 +372,19 @@ def run_leg(
             )
             continue
         trade = simulate_trade(
-            candidate, candles.get(candidate.inst_id, []), params["exit"], assumptions, risk_budget
+            candidate,
+            candles.get(candidate.inst_id, []),
+            params["exit"],
+            assumptions,
+            risk_budget,
+            max_position_fraction,
         )
         taken.append(trade)
-        free_at = trade.closed_at if trade.status == "CLOSED" else datetime.max.replace(tzinfo=UTC)
+        active_until.append(
+            trade.closed_at
+            if trade.status == "CLOSED"
+            else datetime.max.replace(tzinfo=UTC)
+        )
 
     closed = [t for t in taken if t.status == "CLOSED"]
     still_open = [t for t in taken if t.status != "CLOSED"]
@@ -387,6 +409,53 @@ def run_leg(
         "net_quote": str(net_quote.quantize(Decimal("0.0001"))),
         "trades": [t.as_dict(risk_budget) for t in taken],
         "evaluated_at": now,
+    }
+
+
+def summarize_backtest(result: dict[str, Any], equity_quote: Decimal) -> dict[str, Any]:
+    """Presentation metrics from closed simulated trades, in close-time order."""
+    closed = sorted(
+        (t for t in result["trades"] if t["status"] == "CLOSED"),
+        key=lambda t: t["closed_at"],
+    )
+    net_values = [Decimal(str(t["net_quote"])) for t in closed]
+    r_values = [Decimal(str(t["net_r"])) for t in closed]
+    gains = sum((v for v in net_values if v > 0), Decimal(0))
+    losses = -sum((v for v in net_values if v < 0), Decimal(0))
+
+    running = Decimal(0)
+    peak = equity_quote
+    max_drawdown = Decimal(0)
+    curve = []
+    for trade, net in zip(closed, net_values, strict=True):
+        running += net
+        equity = equity_quote + running
+        peak = max(peak, equity)
+        drawdown = (peak - equity) / peak * 100 if peak > 0 else Decimal(0)
+        max_drawdown = max(max_drawdown, drawdown)
+        curve.append({
+            "time": trade["closed_at"],
+            "return_pct": round(float(running / equity_quote * 100), 4)
+            if equity_quote else None,
+        })
+
+    trades = len(closed)
+    winners = sum(1 for value in net_values if value > 0)
+    return {
+        "net_return_pct": round(
+            float(sum(net_values, Decimal(0)) / equity_quote * 100), 4
+        ) if equity_quote else None,
+        "net_r": result["net_r"],
+        "closed_trades": trades,
+        "open_trades": result["open_trades"],
+        "win_rate_pct": round(winners / trades * 100, 1) if trades else None,
+        "profit_factor": round(float(gains / losses), 2) if losses else None,
+        "profit_factor_infinite": bool(gains and not losses),
+        "average_trade_r": round(float(sum(r_values, Decimal(0)) / trades), 3)
+        if trades else None,
+        "max_drawdown_pct": round(float(max_drawdown), 4),
+        "fees_quote": result["fees_r"],
+        "equity_curve": curve,
     }
 
 

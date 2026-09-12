@@ -21,6 +21,7 @@ from agentic_trade.product.simulate import (
     qualifies,
     run_leg,
     simulate_trade,
+    summarize_backtest,
     verdict,
 )
 from agentic_trade.product.templates import DraftRejected
@@ -149,6 +150,7 @@ def test_a_busy_leg_skips_candidates_and_the_skip_is_counted():
     """One concurrency slot: the second setup arrives while the first is open."""
     params = templates.baseline_params()
     params["exit"] = exits(breakeven_r=None, max_hold_bars=12)
+    params["risk"]["max_concurrent_positions"] = 1
     candles = bars(*[("101", "99", "100")] * 12)
     result = run_leg([candidate(0, episode="a"), candidate(1, episode="b")],
                      {"TEST-USDT": candles}, params, FREE)
@@ -164,6 +166,36 @@ def test_fees_are_charged_on_entry_and_on_every_exit_leg():
     # qty = 10 / 10 = 1; entry 100 + exit 90 at 10 bps each.
     assert trade.fees_quote == pytest.approx(Decimal("0.19"))
     assert trade.net_quote == pytest.approx(Decimal("-10.19"))
+
+
+def test_simulation_respects_per_position_allocation_cap():
+    trade = simulate_trade(
+        candidate(), bars(("101", "89", "92")), exits(), FREE, RISK,
+        max_position_fraction=Decimal("0.25"),
+    )
+    assert trade.qty * trade.entry_px <= FREE.equity_quote * Decimal("0.25")
+
+
+def test_backtest_summary_reports_return_drawdown_and_profit_factor():
+    result = {
+        "trades": [
+            {"status": "CLOSED", "closed_at": START, "net_quote": "20", "net_r": 2},
+            {
+                "status": "CLOSED",
+                "closed_at": START + timedelta(minutes=5),
+                "net_quote": "-10",
+                "net_r": -1,
+            },
+        ],
+        "open_trades": 0,
+        "net_r": 1,
+        "fees_r": 0.1,
+    }
+    metrics = summarize_backtest(result, Decimal("1000"))
+    assert metrics["net_return_pct"] == 1.0
+    assert metrics["win_rate_pct"] == 50.0
+    assert metrics["profit_factor"] == 2.0
+    assert metrics["max_drawdown_pct"] == pytest.approx(10 / 1020 * 100, rel=1e-3)
 
 
 def test_small_sample_is_reported_as_insufficient_evidence():

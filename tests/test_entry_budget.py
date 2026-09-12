@@ -86,6 +86,25 @@ async def test_zero_budget_means_unlimited(run_id, decision_id):
     assert count == 3
 
 
+async def test_same_episode_cannot_open_twice(run_id, decision_id):
+    async with pool.ledger().acquire() as con:
+        await con.execute(
+            "UPDATE decisions SET episode_id='episode-one' WHERE decision_id=$1",
+            decision_id,
+        )
+    om = OrderManager(PaperVenue(), run_id)
+    await _reserve(
+        om, decision_id, max_entries_per_run=0,
+        max_concurrent=99, episode_id="episode-one",
+    )
+    with pytest.raises(ReservationDenied) as exc:
+        await _reserve(
+            om, decision_id, max_entries_per_run=0,
+            max_concurrent=99, episode_id="episode-one",
+        )
+    assert exc.value.code == "EPISODE_ALREADY_TRADED"
+
+
 async def test_budget_is_scoped_to_this_run(run_id, decision_id, db):
     """A spent budget must not leak across runs -- arming is per run."""
     om = OrderManager(PaperVenue(), run_id)

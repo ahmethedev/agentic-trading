@@ -29,6 +29,8 @@ export async function request(path, options = {}) {
 export const getMarket = () => request("/api/product/market");
 export const getWorkspace = () => request("/api/product/workspace");
 export const getStrategy = () => request("/api/product/strategy");
+export const getBacktest = (hours = 48) =>
+  request(`/api/product/backtest?hours=${hours}`, { timeout: 45000 });
 export const getSession = () => request("/api/product/session");
 export const getCandles = (inst, bar = "5m") =>
   request(

@@ -13,6 +13,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from ..config import get_settings
 from ..db import pool
 from ..strategy.setup import SetupParams
 
@@ -42,6 +43,9 @@ REASONS = {
     "EQUITY_NOT_VERIFIED": "Sermaye doğrulanmadı",
     "ENTRY_FILLED": "Giriş emri gerçekleşti",
     "ENTRY_NOT_FILLED": "Giriş denemesinde fill oluşmadı",
+    "EPISODE_ALREADY_TRADED": "Bu kurulum için daha önce giriş denendi",
+    "ACCOUNT_BALANCE_REFRESH_FAILED": "Güncel bakiye doğrulanamadı",
+    "BELOW_MIN_SIZE_POSITION_CAP": "Minimum işlem boyutu parite başı tahsis sınırını aşıyor",
 }
 
 
@@ -60,21 +64,26 @@ def explain_codes(codes):
 
 
 def strategy():
+    params = SetupParams()
+    settings = get_settings()
     return {
         "name": "Reclaim · başlangıç stratejisi",
-        "version": "retail_baseline_v1",
+        "version": "hackathon_aggressive_v1",
         "template": "reclaim_v1",
         "source": "Bu kod sürümündeki referans; eski run'larda tam config snapshot yok.",
         "timeframes": {"context": "15m", "setup": "5m", "flow": "60s"},
-        "params": asdict(SetupParams()),
+        "params": asdict(params),
         "rules": [
-            "15 dakikalık bağlamda fiyat 20 mumluk ortalamanın üzerinde, eğim pozitif.",
+            "15 dakikalık bağlamda fiyat ortalama üzerinde veya eğim sert biçimde negatif değil.",
             "5 dakikalık kapanış, önceden onaylanan pivot seviyesini geri kazanır.",
-            "Göreli hacim ≥ 1,30; alıcı/satıcı akış dengesizliği ≥ 0,15; kapanış üst yarıda.",
-            "Seviyeden uzaklaşma ≤ 1 ATR; stop geri çekilmenin en düşük fiyatında.",
+            f"Göreli hacim ≥ {params.min_rvol:.2f}; akış dengesizliği ≥ "
+            f"{params.min_flow_imbalance:.2f}; kapanış konumu ≥ {params.min_close_position:.2f}.",
+            f"Seviyeden uzaklaşma ≤ {params.max_extension_atr:.1f} ATR; "
+            "stop geri çekilmenin dibinde.",
         ],
-        "risk": "Referans: işlem başına %1, operasyonel üst sınır %2. "
-        "Aktif run'ın tam risk config'i henüz sürümlenmiş değil.",
+        "risk": f"Aktif profil: hedef risk %{settings.risk_fraction * 100:g}, "
+        f"en fazla {settings.max_concurrent_positions} pozisyon; her giriş en çok "
+        f"bakiyenin %{settings.max_position_fraction * 100:g}'ini kullanır.",
         "execution": "Mevcut canlı yol: limit IOC giriş; tüm miktara yapısal stop ve +2,5R OCO.",
         "exit_reference": "+1R başabaş, +2R %30, +2,5R %60 ve %10 runner referans plandır; "
         "canlı worker'da kademeli çıkış döngüsü henüz bağlı değil.",
@@ -444,9 +453,10 @@ async def answer_question(message: str, inst_id: str | None, hours: int):
             recent = data.get("decisions", [])
             if recent:
                 last = recent[0]
+                threshold = SetupParams().min_rvol
                 text += (
                     f"\nSon kayıt: {last['inst_id']}, göreli hacim "
-                    f"{number(last['features'].get('rvol'))} (eşik 1,30). "
+                    f"{number(last['features'].get('rvol'))} (eşik {threshold:.2f}). "
                     + "; ".join(last.get("reasons", []))
                 )
             if f["confirmed"]:

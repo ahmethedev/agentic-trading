@@ -53,7 +53,7 @@ def test_pivot_requires_right_side_confirmation_no_lookahead():
     # Truncate so the pivot at 30 has only 1 closed bar to its right (needs 2),
     # plus a trigger bar that is excluded from level formation.
     truncated = cs[:33]
-    got = find_pivot_high(truncated, P)
+    got = find_pivot_high(truncated, SetupParams(pivot_right=2))
     assert got is None or got[0] != 30
 
 
@@ -82,7 +82,7 @@ def test_shallow_pullback_is_rejected():
     # ATR is 2 in good_feats(); a 0.2 dip is 0.1 ATR, under min_pullback_atr=0.3
     cs += [mk(31 + j, 109.9, 109.95, 109.8, 109.9) for j in range(4)]
     cs.append(mk(35, 109.9, 112, 109.8, 111.5))
-    r = detect("TEST-USDT", cs, good_feats())
+    r = detect("TEST-USDT", cs, good_feats(), SetupParams(min_pullback_atr=0.3))
     assert r.stage is Stage.NO_SETUP
     assert "PULLBACK_TOO_SHALLOW" in r.reason_codes
 
@@ -90,13 +90,22 @@ def test_shallow_pullback_is_rejected():
 def test_deep_enough_pullback_is_accepted():
     r = detect("TEST-USDT", reclaim_series(), good_feats())
     assert r.stage is Stage.CONFIRMED
-    assert r.evidence["pullback_depth_atr"] >= 0.3
+    assert r.evidence["pullback_depth_atr"] >= P.min_pullback_atr
 
 
 def test_regime_gate_blocks_downtrend():
-    r = detect("TEST-USDT", reclaim_series(), good_feats(above_ma=False))
+    r = detect(
+        "TEST-USDT",
+        reclaim_series(),
+        good_feats(above_ma=False, trend_slope_atr=-0.2),
+    )
     assert r.stage is Stage.REGIME_REJECTED
     assert "REGIME_BELOW_MA" in r.reason_codes
+
+
+def test_aggressive_regime_accepts_one_supportive_signal():
+    r = detect("TEST-USDT", reclaim_series(), good_feats(above_ma=False))
+    assert r.stage is Stage.CONFIRMED
 
 
 def test_missing_flow_is_not_treated_as_neutral():

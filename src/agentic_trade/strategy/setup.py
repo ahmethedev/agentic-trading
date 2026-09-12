@@ -1,4 +1,4 @@
-"""Reclaim setup detection (retail_baseline_v1 hypothesis).
+"""Reclaim setup detection (hackathon_aggressive_v1 hypothesis).
 
 Hypothesis (AGENT.md §4): in an uptrend context, after a pullback below a level
 that was defined by EARLIER closed candles, a close back above that level --
@@ -38,21 +38,27 @@ class Stage(StrEnum):
 
 @dataclass(frozen=True)
 class SetupParams:
-    """Starting config. These are recorded hypotheses, not tuned optima."""
+    """Short-horizon demo profile. These are hypotheses, not tuned optima.
 
-    pivot_left: int = 2          # bars left of the pivot high
-    pivot_right: int = 2         # bars right -- all must be CLOSED (no lookahead)
-    lookback: int = 30           # how far back to search for the level
-    min_slope_atr: float = 0.0   # regime: MA slope per bar, in ATR units
-    min_rvol: float = 1.3        # confirmation: relative volume
-    min_flow_imbalance: float = 0.15  # confirmation: taker buy dominance
-    min_close_position: float = 0.5   # trigger candle should close in upper half
+    The profile deliberately accepts either a supportive price/MA relationship
+    OR a non-hostile slope. Requiring both made a short hackathon observation
+    window spend most of its time at the regime gate.
+    """
+
+    pivot_left: int = 1          # bars left of the pivot high
+    pivot_right: int = 1         # bars right -- all must be CLOSED (no lookahead)
+    lookback: int = 20           # how far back to search for the level
+    min_slope_atr: float = -0.05  # tolerate a mild downslope, reject sharp weakness
+    require_both_regime_checks: bool = False
+    min_rvol: float = 0.75       # participation need not exceed its median
+    min_flow_imbalance: float = -0.15  # reject only clear taker-sell dominance
+    min_close_position: float = 0.25   # avoid only the weakest closes
     # A pullback must be a real dip. Bars immediately after a pivot high always
     # close below it by construction, so depth -- not mere "closed below" -- is
     # what makes the setup meaningful.
-    min_pullback_atr: float = 0.3
-    max_extension_atr: float = 1.0    # don't chase far above the level
-    min_stop_distance_atr: float = 0.25  # reject meaninglessly tight stops
+    min_pullback_atr: float = 0.05
+    max_extension_atr: float = 2.5    # wider demo window for fast breakouts
+    min_stop_distance_atr: float = 0.10  # reject only meaninglessly tight stops
 
 
 DEFAULT_PARAMS = SetupParams()
@@ -121,10 +127,21 @@ def detect(
     atr = feats.atr
 
     # --- gate 1: regime ------------------------------------------------------
-    if not feats.above_ma:
-        codes.append("REGIME_BELOW_MA")
-    if feats.trend_slope_atr is None or feats.trend_slope_atr <= params.min_slope_atr:
-        codes.append("REGIME_SLOPE_WEAK")
+    above_ok = bool(feats.above_ma)
+    slope_ok = (
+        feats.trend_slope_atr is not None
+        and feats.trend_slope_atr > params.min_slope_atr
+    )
+    if params.require_both_regime_checks:
+        if not above_ok:
+            codes.append("REGIME_BELOW_MA")
+        if not slope_ok:
+            codes.append("REGIME_SLOPE_WEAK")
+    elif not (above_ok or slope_ok):
+        if not above_ok:
+            codes.append("REGIME_BELOW_MA")
+        if not slope_ok:
+            codes.append("REGIME_SLOPE_WEAK")
     if codes:
         return SetupCandidate(
             inst_id, Stage.REGIME_REJECTED, codes,

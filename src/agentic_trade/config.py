@@ -57,11 +57,28 @@ class Settings(BaseSettings):
     # observe: no orders at all. paper: simulated fills. live: real orders.
     mode: str = Field(default="observe", alias="MODE")
     quote_ccy: str = Field(default="USDT", alias="QUOTE_CCY")
+    # Liquid, actively traded spot universe used by the short hackathon run.
+    # Keeping this in env makes the universe adjustable without another build.
+    market_instruments: str = Field(
+        default=(
+            "BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,"
+            "SUI-USDT,LINK-USDT,AVAX-USDT"
+        ),
+        alias="INSTRUMENTS",
+    )
 
     # --- Risk (retail_baseline_v1 reference profile) -----------------------
-    risk_fraction: Decimal = Field(default=Decimal("0.01"), alias="RISK_FRACTION")
+    risk_fraction: Decimal = Field(default=Decimal("0.02"), alias="RISK_FRACTION")
     risk_fraction_max: Decimal = Field(default=Decimal("0.02"), alias="RISK_FRACTION_MAX")
-    max_concurrent_positions: int = Field(default=1, alias="MAX_CONCURRENT_POSITIONS")
+    max_concurrent_positions: int = Field(
+        default=4, ge=1, alias="MAX_CONCURRENT_POSITIONS"
+    )
+    # A risk-sized order can otherwise consume nearly all quote balance when
+    # the structural stop is tight. Cap each entry so several independent pairs
+    # can participate in the percentage return during the demo window.
+    max_position_fraction: Decimal = Field(
+        default=Decimal("0.25"), gt=0, le=1, alias="MAX_POSITION_FRACTION"
+    )
     # Entries this run may OPEN before the gate stops authorising new ones.
     # 0 = unlimited. Set to 1 for a supervised first live entry: the order goes
     # out, and no second one can follow while attention is elsewhere. Exits and
@@ -104,6 +121,13 @@ class Settings(BaseSettings):
         """Instruments entries are allowed on, or None for no restriction."""
         names = {p.strip() for p in self.entry_instruments.split(",") if p.strip()}
         return frozenset(names) or None
+
+    @property
+    def instrument_list(self) -> list[str]:
+        """Ordered, de-duplicated market-data and decision universe."""
+        return list(dict.fromkeys(
+            p.strip() for p in self.market_instruments.split(",") if p.strip()
+        ))
 
     @property
     def llm_enabled(self) -> bool:

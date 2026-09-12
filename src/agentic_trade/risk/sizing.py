@@ -52,6 +52,9 @@ class SizingInput:
     taker_fee_rate: Decimal        # e.g. 0.001 = 10bps, from the venue
     spec: InstrumentSpec
     risk_fraction_max: Decimal = Decimal("0.02")
+    # Maximum quote spend for one position as a fraction of total equity. This
+    # is separate from stop risk: a tight stop must not monopolise all cash.
+    max_position_fraction: Decimal = Decimal("1")
     # When the risk-implied quantity lands below the venue minimum, take the
     # minimum anyway IF its risk still fits inside risk_fraction_max. Without
     # this a small account can never trade an instrument at all: every approved
@@ -69,6 +72,7 @@ class SizingResult:
     account_r_unit: Decimal
     est_cost_per_unit: Decimal
     risk_ceiling: Decimal          # equity * risk_fraction_max, the hard bound
+    position_notional_cap: Decimal # max quote notional allocated to this entry
     capped_by: list[str]           # why quantity is below the risk-implied size
 
 
@@ -102,6 +106,10 @@ def compute_size(inp: SizingInput) -> SizingResult:
         )
     if inp.equity_quote <= 0:
         raise RiskRejection("NO_EQUITY", str(inp.equity_quote))
+    if inp.max_position_fraction <= 0 or inp.max_position_fraction > 1:
+        raise RiskRejection(
+            "POSITION_FRACTION_INVALID", str(inp.max_position_fraction)
+        )
 
     price_r = inp.entry_reference - inp.structural_stop
     if price_r <= 0:
@@ -120,13 +128,19 @@ def compute_size(inp: SizingInput) -> SizingResult:
 
     # Spot has no leverage: notional cannot exceed the spendable balance, and we
     # must leave room for the entry fee.
-    max_notional = inp.available_quote / (Decimal(1) + inp.taker_fee_rate)
+    position_spend_cap = inp.equity_quote * inp.max_position_fraction
+    spend_cap = min(inp.available_quote, position_spend_cap)
+    max_notional = spend_cap / (Decimal(1) + inp.taker_fee_rate)
     qty_by_balance = max_notional / inp.entry_reference if inp.entry_reference > 0 else Decimal(0)
 
     qty = qty_by_risk
     if qty_by_balance < qty:
         qty = qty_by_balance
-        capped.append("SPOT_BALANCE")
+        capped.append(
+            "SPOT_BALANCE"
+            if inp.available_quote <= position_spend_cap
+            else "POSITION_CAP"
+        )
 
     qty = _floor_to_step(qty, inp.spec.lot_sz)
     if qty < qty_by_risk:
@@ -165,6 +179,11 @@ def compute_size(inp: SizingInput) -> SizingResult:
                 "BELOW_MIN_SIZE_BALANCE",
                 f"venue minimum {min_qty} costs {min_notional} quote incl. fee; "
                 f"only {inp.available_quote} spendable")
+        if min_notional > position_spend_cap:
+            raise RiskRejection(
+                "BELOW_MIN_SIZE_POSITION_CAP",
+                f"venue minimum {min_qty} costs {min_notional} quote incl. fee; "
+                f"per-position cap is {position_spend_cap}")
 
         # Take the venue minimum. It costs more than the TARGET budget but still
         # sits inside the hard ceiling -- the number that actually bounds a loss
@@ -186,7 +205,8 @@ def compute_size(inp: SizingInput) -> SizingResult:
         quantity=qty, notional=notional, risk_budget=risk_budget,
         risk_at_stop=risk_at_stop, price_r_distance=price_r,
         account_r_unit=account_r_unit, est_cost_per_unit=est_cost_per_unit,
-        risk_ceiling=risk_ceiling, capped_by=capped,
+        risk_ceiling=risk_ceiling, position_notional_cap=max_notional,
+        capped_by=capped,
     )
 
 

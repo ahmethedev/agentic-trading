@@ -107,6 +107,7 @@ class OrderManager:
         price_r_distance: Decimal, qty: Decimal, est_cost_per_unit: Decimal,
         policy_version: str, max_concurrent: int = 1,
         max_entries_per_run: int = 0,
+        episode_id: str | None = None,
     ) -> int:
         """Persist an intent and claim the position slot, atomically.
 
@@ -118,6 +119,26 @@ class OrderManager:
             async with con.transaction():
                 # Serialise all reservation attempts for this run.
                 await con.execute("SELECT pg_advisory_xact_lock($1)", self._run_id)
+
+                # A setup is evaluated every 30 seconds until the next closed
+                # candle. Unlimited entry budgets must not turn those repeated
+                # evaluations into repeated orders for the same opportunity.
+                if episode_id is not None:
+                    already_traded = await con.fetchval(
+                        """SELECT 1 FROM intents i
+                           JOIN decisions d USING(decision_id)
+                           JOIN runs r ON r.run_id=i.run_id
+                           WHERE i.side='buy' AND d.episode_id=$1
+                             AND r.mode=(SELECT mode FROM runs WHERE run_id=$2)
+                           LIMIT 1""",
+                        episode_id,
+                        self._run_id,
+                    )
+                    if already_traded:
+                        raise ReservationDenied(
+                            "EPISODE_ALREADY_TRADED",
+                            f"entry already attempted for {episode_id}",
+                        )
 
                 open_positions = await con.fetchval(
                     "SELECT count(*) FROM positions WHERE status <> 'CLOSED'"

@@ -27,7 +27,14 @@ import structlog
 
 from ..db import pool
 from . import templates
-from .simulate import Assumptions, Candidate, Candle, run_leg, verdict
+from .simulate import (
+    Assumptions,
+    Candidate,
+    Candle,
+    run_leg,
+    summarize_backtest,
+    verdict,
+)
 from .templates import DraftRejected
 
 log = structlog.get_logger(__name__)
@@ -86,8 +93,10 @@ async def ensure_baseline() -> dict[str, Any]:
             )
             row = await con.fetchrow(
                 """SELECT * FROM strategy_versions
-                   WHERE strategy_id=$1 AND is_baseline ORDER BY version_id LIMIT 1""",
+                   WHERE strategy_id=$1 AND is_baseline AND label=$2
+                   ORDER BY version_id LIMIT 1""",
                 strategy_id,
+                templates.BASELINE_LABEL,
             )
             if row is None:
                 row = await con.fetchrow(
@@ -202,8 +211,10 @@ async def start_experiment(version_id: int, mode: str) -> dict[str, Any]:
             )
         baseline = await con.fetchrow(
             """SELECT * FROM strategy_versions
-               WHERE strategy_id=$1 AND is_baseline ORDER BY version_id LIMIT 1""",
+               WHERE strategy_id=$1 AND is_baseline AND label=$2
+               ORDER BY version_id LIMIT 1""",
             variant["strategy_id"],
+            templates.BASELINE_LABEL,
         )
         if baseline is None:
             raise DraftRejected("Başlangıç sürümü kayıtlı değil.")
@@ -365,6 +376,37 @@ async def load_candles(inst_ids: list[str], since: datetime) -> dict[str, list[C
     return out
 
 
+async def backtest(hours: int = REPLAY_WINDOW_H) -> dict[str, Any]:
+    """Evaluate the current live profile over the recorded candidate archive."""
+    now = datetime.now(UTC)
+    window_from = now - timedelta(hours=hours)
+    params = templates.baseline_params()
+    assumptions = _assumptions()
+    candidates = await load_candidates(window_from, now)
+    inst_ids = sorted({candidate.inst_id for candidate in candidates})
+    candles = await load_candles(inst_ids, window_from - timedelta(hours=1))
+    result = run_leg(candidates, candles, params, assumptions, now=now)
+    return {
+        "generated_at": now,
+        "policy_version": templates.BASELINE_LABEL,
+        "window": {"from": window_from, "to": now, "hours": hours},
+        "assumptions": assumptions.as_dict(),
+        "metrics": summarize_backtest(result, assumptions.equity_quote),
+        "result": result,
+        "coverage": {
+            "candidate_episodes": len({candidate.episode_id for candidate in candidates}),
+            "instruments": inst_ids,
+            "candles": sum(len(rows) for rows in candles.values()),
+        },
+        "limits": [
+            "Sonuç simülasyondur; canlı fill değildir.",
+            "Yalnız worker'ın o anda kaydettiği setup adayları yeniden değerlendirilir; "
+            "aday aşamasına hiç ulaşmayan tarihsel mumlar kapsama girmez.",
+            "Çıkış sırası 5 dakikalık mum içinde bilinmiyorsa stop varsayılır.",
+        ],
+    }
+
+
 async def evaluate(exp_run_id: int, *, force: bool = False) -> dict[str, Any]:
     """Recompute a run's result if the snapshot is stale, and persist it."""
     now = datetime.now(UTC)
@@ -462,7 +504,9 @@ async def overview() -> dict[str, Any]:
         versions = await con.fetch(
             """SELECT v.* FROM strategy_versions v
                WHERE v.strategy_id=(SELECT strategy_id FROM strategies WHERE slug='reclaim')
-               ORDER BY v.version_id DESC LIMIT 20"""
+                 AND (v.version_id=$1 OR v.parent_version_id=$1)
+               ORDER BY v.version_id DESC LIMIT 20""",
+            baseline["version_id"],
         )
         experiments = await con.fetch(
             """SELECT e.*, b.mode, b.status baseline_status, b.last_evaluated_at,

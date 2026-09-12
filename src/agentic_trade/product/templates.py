@@ -28,7 +28,7 @@ from ..risk.sizing import (
 from ..strategy.setup import SetupParams
 
 TEMPLATE = "reclaim_v1"
-BASELINE_LABEL = "retail_baseline_v1"
+BASELINE_LABEL = "hackathon_aggressive_v1"
 
 # Time cap on the runner leg. The live plan has no time stop: it holds the
 # remainder until the stop is hit. A simulation cannot hold a position open for
@@ -43,7 +43,10 @@ def baseline_params() -> dict[str, Any]:
     setup = SetupParams()
     return {
         "template": TEMPLATE,
-        "universe": ["BTC-USDT", "ETH-USDT", "SOL-USDT"],
+        "universe": [
+            "BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT",
+            "DOGE-USDT", "SUI-USDT", "LINK-USDT", "AVAX-USDT",
+        ],
         "timeframes": {"context": "15m", "setup": "5m", "flow": "60s"},
         "entry": {
             "min_rvol": float(setup.min_rvol),
@@ -64,7 +67,11 @@ def baseline_params() -> dict[str, Any]:
             "runner_fraction": float(RUNNER_FRACTION),
             "max_hold_bars": DEFAULT_MAX_HOLD_BARS,
         },
-        "risk": {"risk_fraction": 0.01, "max_concurrent_positions": 1},
+        "risk": {
+            "risk_fraction": 0.02,
+            "max_concurrent_positions": 4,
+            "max_position_fraction": 0.25,
+        },
     }
 
 
@@ -279,7 +286,7 @@ def describe(params: dict[str, Any]) -> list[str]:
     entry, exit_rules = params["entry"], params["exit"]
     breakeven = exit_rules["breakeven_r"]
     return [
-        "15 dakikalık bağlamda fiyat 20 mumluk ortalamanın üzerinde, eğim pozitif.",
+        "15 dakikalık bağlamda fiyat ortalama üzerinde veya eğim sert biçimde negatif değil.",
         "5 dakikalık kapanış, önceden onaylanan pivot seviyesini geri kazanır.",
         f"Göreli hacim ≥ {_num(entry['min_rvol'])}; akış dengesizliği ≥ "
         f"{_num(entry['min_flow_imbalance'])}; kapanış konumu ≥ "

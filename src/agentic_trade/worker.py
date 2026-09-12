@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import json
 import signal
+from dataclasses import asdict
 from decimal import Decimal
 
 import structlog
@@ -35,8 +36,7 @@ from .strategy.setup import SetupParams, Stage, detect
 
 log = structlog.get_logger(__name__)
 
-POLICY_VERSION = "retail_baseline_v1"
-DEFAULT_INSTRUMENTS = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+POLICY_VERSION = "hackathon_aggressive_v1"
 # Fallback fee used only while unauthenticated. The real account fee comes from
 # account_get_trade_fee and must replace this before any live sizing.
 ASSUMED_TAKER_FEE = Decimal("0.001")
@@ -49,7 +49,8 @@ ENTRY_SLIPPAGE_CAP = Decimal("0.001")
 class Worker:
     def __init__(self, settings: Settings, instruments: list[str] | None = None) -> None:
         self._s = settings
-        self._instruments = instruments or DEFAULT_INSTRUMENTS
+        self._instruments = instruments if instruments is not None else settings.instrument_list
+        self._setup_params = SetupParams()
         self._atk: AtkClient | None = None
         self._run_id: int | None = None
         self._stop = asyncio.Event()
@@ -88,6 +89,9 @@ class Worker:
                 json.dumps({"instruments": self._instruments,
                             "authenticated": s.has_credentials,
                             "max_entries_per_run": s.max_entries_per_run,
+                            "max_concurrent_positions": s.max_concurrent_positions,
+                            "max_position_fraction": str(s.max_position_fraction),
+                            "setup_params": asdict(self._setup_params),
                             "entry_instruments":
                                 sorted(s.armed_instruments)
                                 if s.armed_instruments else None}),
@@ -168,55 +172,60 @@ class Worker:
             log.warning("worker.unauthenticated",
                         missing=self._s.missing_credentials())
             return
+        await self._refresh_account_balance()
         try:
-            bal = await self._atk.call("account_get_balance", {})
-            account = bal["data"]["data"][0]
-            details = account.get("details") or []
-            # A successful balance read is authoritative even when it reports
-            # nothing: an authenticated but unfunded account must NOT silently
-            # fall back to the placeholder equity and size against money that
-            # does not exist. Absent currency detail means zero.
-            #
-            # Equity is the WHOLE account (totalEq), not the quote balance: an
-            # account that is fully deployed into a position has not become a
-            # poorer account, and a risk budget that shrinks with every fill
-            # would make the next entry unsizeable for the wrong reason.
-            self._equity = Decimal(account.get("totalEq") or 0)
-            self._available_quote = Decimal("0")
-            self._equity_is_real = True
-            for d in details:
-                if d["ccy"] == self._s.quote_ccy:
-                    # availBal excludes anything locked by a resting order.
-                    self._available_quote = Decimal(d.get("availBal") or 0)
-            if self._equity <= 0:
-                await self._ops("warn", "account_unfunded", detail={
-                    "quote_ccy": self._s.quote_ccy,
-                    "total_eq": account.get("totalEq"),
-                    "impact": "no entry can be sized until the account is funded",
-                })
-                log.warning("worker.account_unfunded",
-                            quote_ccy=self._s.quote_ccy,
-                            total_eq=account.get("totalEq"))
             fee = await self._atk.call("account_get_trade_fee",
                                        {"instType": "SPOT"})
             taker = fee["data"]["data"][0]["taker"]
             # OKX returns fee rates as negative strings (a cost).
             self._taker_fee = abs(Decimal(taker))
             self._fee_is_real = True
-            log.info("worker.account_loaded", equity=str(self._equity),
-                     available_quote=str(self._available_quote),
-                     taker_fee=str(self._taker_fee))
+            log.info("worker.fee_loaded", taker_fee=str(self._taker_fee))
         except (AtkError, AtkTimeout, KeyError, IndexError) as exc:
             await self._ops("error", "account_load_failed",
                             detail={"error": str(exc)[:300]})
             log.error("worker.account_load_failed", err=str(exc)[:200])
+
+    async def _refresh_account_balance(self) -> bool:
+        """Refresh equity and free quote before sizing a live candidate.
+
+        With several concurrent positions, startup cash becomes stale after the
+        first fill. Sizing a second entry from that stale value causes avoidable
+        venue rejections and can overstate the amount available to allocate.
+        """
+        assert self._atk
+        try:
+            bal = await self._atk.call("account_get_balance", {})
+            account = bal["data"]["data"][0]
+            details = account.get("details") or []
+            self._equity = Decimal(account.get("totalEq") or 0)
+            self._available_quote = Decimal("0")
+            self._equity_is_real = True
+            for detail in details:
+                if detail["ccy"] == self._s.quote_ccy:
+                    self._available_quote = Decimal(detail.get("availBal") or 0)
+                    break
+            if self._equity <= 0:
+                await self._ops("warn", "account_unfunded", detail={
+                    "quote_ccy": self._s.quote_ccy,
+                    "total_eq": account.get("totalEq"),
+                    "impact": "no entry can be sized until the account is funded",
+                })
+            log.info("worker.account_loaded", equity=str(self._equity),
+                     available_quote=str(self._available_quote))
+            return True
+        except (AtkError, AtkTimeout, KeyError, IndexError) as exc:
+            await self._ops("error", "account_balance_refresh_failed",
+                            detail={"error": str(exc)[:300]})
+            log.error("worker.account_balance_refresh_failed", err=str(exc)[:200])
+            return False
 
     # ------------------------------------------------------------ decisions --
     async def evaluate(self, inst_id: str) -> None:
         """One evaluation pass for one instrument; always writes a decision row."""
         feats = await compute_snapshot(inst_id)
         candles = await load_closed_candles(inst_id, "5m", limit=60)
-        result = detect(inst_id, candles, feats, SetupParams())
+        result = detect(inst_id, candles, feats, self._setup_params)
 
         action = "WAIT"
         reason_codes = list(result.reason_codes)
@@ -241,6 +250,13 @@ class Worker:
         spec = self._specs.get(inst_id)
         if spec is None:
             return "WAIT", ["NO_INSTRUMENT_SPEC"], note
+
+        if (
+            self._s.mode == "live"
+            and self._s.has_credentials
+            and not await self._refresh_account_balance()
+        ):
+            return "WAIT", ["ACCOUNT_BALANCE_REFRESH_FAILED"], note
 
         gate_result = await gate.evaluate(
             inst_id, mode=self._s.mode, equity=self._equity,
@@ -267,6 +283,7 @@ class Worker:
                 structural_stop=result.structural_stop,
                 risk_fraction=self._s.risk_fraction,
                 risk_fraction_max=self._s.risk_fraction_max,
+                max_position_fraction=self._s.max_position_fraction,
                 taker_fee_rate=self._taker_fee, spec=spec,
                 allow_min_size_uplift=self._s.min_size_uplift,
             ))
@@ -275,6 +292,7 @@ class Worker:
                 "risk_budget": str(sized.risk_budget),
                 "risk_at_stop": str(sized.risk_at_stop),
                 "risk_ceiling": str(sized.risk_ceiling),
+                "position_notional_cap": str(sized.position_notional_cap),
                 "price_r_distance": str(sized.price_r_distance),
                 "capped_by": sized.capped_by,
                 "equity": str(self._equity),
@@ -341,6 +359,7 @@ class Worker:
             policy_version=POLICY_VERSION,
             max_concurrent=self._s.max_concurrent_positions,
             max_entries_per_run=self._s.max_entries_per_run,
+            episode_id=result.episode_id,
         )
 
         outcome = await self._om.submit_entry(

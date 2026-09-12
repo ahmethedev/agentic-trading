@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, SecretStr
 
@@ -291,6 +291,12 @@ async def get_strategy():
 async def get_workspace(request: Request):
     require_operator(request)
     return await workspace()
+
+
+@router.get("/backtest")
+async def get_backtest(request: Request, hours: int = Query(48, ge=6, le=168)):
+    require_operator(request)
+    return await experiments.backtest(hours)
 
 
 # --- experiments ------------------------------------------------------------

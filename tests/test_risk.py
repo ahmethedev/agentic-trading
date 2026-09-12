@@ -56,6 +56,22 @@ def test_spot_balance_cap_agentmd_worked_example():
     assert r.quantity == D("10")               # 1000 balance / 100 price
 
 
+def test_position_cap_keeps_a_tight_stop_from_using_all_cash():
+    r = compute_size(mk(
+        entry_reference=D("100"), structural_stop=D("99.5"),
+        max_position_fraction=D("0.25"),
+    ))
+    assert "POSITION_CAP" in r.capped_by
+    assert r.notional <= D("250")
+    assert r.position_notional_cap == D("250")
+
+
+def test_position_fraction_must_be_a_real_fraction():
+    with pytest.raises(RiskRejection) as e:
+        compute_size(mk(max_position_fraction=D("1.1")))
+    assert e.value.code == "POSITION_FRACTION_INVALID"
+
+
 def test_wider_stop_needs_less_notional():
     """Same 10 risk at a 2% stop = 500 notional, well inside the balance."""
     r = compute_size(mk(structural_stop=D("98")))

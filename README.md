@@ -4,7 +4,7 @@ Spot trading agent for OKX TR built on the mandatory OKX Agent Trade Kit (ATK).
 Records every decision — including every WAIT and its reason — so the funnel from
 market data to fill is reconstructable from the database alone.
 
-Design source: [AGENT.md](AGENT.md). Active policy profile: `retail_baseline_v1`.
+Design source: [AGENT.md](AGENT.md). Active policy profile: `hackathon_aggressive_v1`.
 
 > Status: **Deployed to the VPS in `observe` mode, collecting data.** Gate 1 (see)
 > and Gate 2 (control) built. The full chain
@@ -50,6 +50,9 @@ DATABASE_URL=postgresql://agentic:...@127.0.0.1:5433/agentic_trade
 MODE=observe                  # observe | paper | live
 MAX_ENTRIES_PER_RUN=0         # 0 = unlimited; 1 arms a single supervised entry
 ENTRY_INSTRUMENTS=            # empty = all; e.g. BTC-USDT restricts entries only
+INSTRUMENTS=BTC-USDT,ETH-USDT,SOL-USDT,XRP-USDT,DOGE-USDT,SUI-USDT,LINK-USDT,AVAX-USDT
+MAX_CONCURRENT_POSITIONS=4
+MAX_POSITION_FRACTION=0.25    # no single pair can consume the whole balance
 ANTHROPIC_API_KEY=            # optional; without it the chat uses the reader
 LLM_MODEL=claude-haiku-4-5    # cheapest current model; claude-opus-5 reasons harder
 ```
@@ -265,26 +268,24 @@ position insert leaves real inventory with no stop and no exit ladder. Nothing i
 invented in rebuilding it — the quantity and average price come from actual stored
 fills, and the structural stop and policy version from the durable intent row.
 
-## Supervised first entry
+## Active hackathon profile
 
-No live order has been sent yet. The first one should be watched, not discovered
-unattended, so the run is *armed* for exactly one entry:
+The short demo run is intentionally wider than the original supervised-entry
+profile. It can take distinct setup episodes across several pairs while keeping
+one tight-stop setup from consuming the whole quote balance:
 
 ```
 MODE=live
-MAX_ENTRIES_PER_RUN=1
+MAX_ENTRIES_PER_RUN=0
+MAX_CONCURRENT_POSITIONS=4
+MAX_POSITION_FRACTION=0.25
 ENTRY_INSTRUMENTS=            # empty = every ingested pair is armed
 ```
 
-The worker then sends at most one entry for the life of that run. All three ingested
-pairs are candidates and compete for that single slot — whichever confirms first
-takes it. After it is reserved, every further candidate is refused with
-`ENTRY_BUDGET_EXHAUSTED` and the reason appears in the decision funnel. Restarting
-the worker starts a new run and re-arms the budget — arming is per run,
-deliberately, so a restart is an explicit decision to allow another entry.
-
-`MAX_CONCURRENT_POSITIONS=1` binds alongside it: widening `ENTRY_INSTRUMENTS` widens
-which pair may be chosen, never how many positions may be open at once.
+The worker accepts unlimited distinct entry episodes over the life of the run,
+with at most four open/pending positions. Each entry can spend at most 25% of
+equity, and a stable episode id prevents repeated 30-second evaluations of the
+same setup from opening duplicates.
 
 Watch it with:
 
