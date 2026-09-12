@@ -60,7 +60,8 @@ h2 { font-size: 12px; margin: 0 0 10px; color: var(--muted); font-weight: 600;
 .kv div { background: var(--panel); border: 1px solid var(--line);
           border-radius: 6px; padding: 7px 8px; }
 .kv .k { color: var(--dim); font: 10px/1.3 var(--mono); text-transform: uppercase; }
-.kv .v { font: 600 12px/1.4 var(--mono); margin-top: 3px; }
+.kv .v { font: 600 12px/1.4 var(--mono); margin-top: 3px;
+          overflow-wrap: anywhere; }
 
 /* funnel */
 .funnel-row { display: flex; align-items: center; gap: 10px; margin-bottom: 7px; }

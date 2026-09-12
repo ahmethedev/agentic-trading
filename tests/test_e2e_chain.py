@@ -34,7 +34,8 @@ def candidate() -> SetupCandidate:
     )
 
 
-async def make_worker(run_id: int, mode: str = "paper", faults: Faults | None = None):
+async def make_worker(run_id: int, mode: str = "paper", faults: Faults | None = None,
+                      venue: PaperVenue | None = None):
     s = get_settings()
     s.__dict__["mode"] = mode          # bypass the cached singleton for the test
     w = Worker(s, instruments=[INST])
@@ -44,10 +45,26 @@ async def make_worker(run_id: int, mode: str = "paper", faults: Faults | None = 
     w._equity_is_real = True
     w._taker_fee = D("0.001")
     w._fee_is_real = True
-    w._venue = PaperVenue(fee_rate=D("0.001"), faults=faults or Faults())
+    w._venue = venue or PaperVenue(fee_rate=D("0.001"), faults=faults or Faults())
     from agentic_trade.execution.order_manager import OrderManager
     w._om = OrderManager(w._venue, run_id)
+    # Run the real startup reconciliation rather than faking its result: the
+    # gate refuses to trade until it has agreed the ledger with the venue.
+    from agentic_trade.execution.reconcile import Reconciler
+    report = await Reconciler(w._venue, w._om, run_id).run()
+    w._reconciled = report.is_clean
     return w
+
+
+async def test_gate_blocks_until_reconciled(run_id):
+    """Belt and braces: an unreconciled worker must not reach the order path."""
+    w = await make_worker(run_id)
+    w._reconciled = False
+    action, codes, note = await w._handle_candidate(INST, candidate())
+    assert action == "WAIT"
+    assert "RECONCILE_INCOMPLETE" in codes
+    assert "execution" not in note
+    assert w._venue.placed_calls == 0
 
 
 async def test_full_chain_opens_a_protected_position(run_id):
@@ -127,8 +144,8 @@ async def test_observe_mode_never_sends_an_order(run_id):
 
 async def test_unknown_entry_leaves_no_position_and_blocks_next(run_id):
     """An unresolvable entry must not open a position, and must block re-entry."""
-    w = await make_worker(run_id, faults=Faults(place_timeout=True,
-                                                get_order_timeout=True))
+    venue = PaperVenue(faults=Faults(place_timeout=True, get_order_timeout=True))
+    w = await make_worker(run_id, venue=venue)
     action, codes, note = await w._handle_candidate(INST, candidate())
 
     assert action == "WAIT"
@@ -138,10 +155,41 @@ async def test_unknown_entry_leaves_no_position_and_blocks_next(run_id):
         assert await con.fetchval(
             "SELECT count(*) FROM positions WHERE run_id=$1", run_id) == 0
 
-    w2 = await make_worker(run_id)
-    a2, codes2, _ = await w2._handle_candidate(INST, candidate())
+    # While the venue still cannot answer, the slot stays held.
+    w._reconciled = False
+    a2, codes2, _ = await w._handle_candidate(INST, candidate())
     assert a2 == "WAIT"
-    assert "UNRESOLVED_ORDER" in codes2 or "CONCURRENCY_LIMIT" in codes2
+    assert {"RECONCILE_INCOMPLETE", "UNRESOLVED_ORDER", "CONCURRENCY_LIMIT"} & set(codes2)
+
+
+async def test_restart_rebuilds_a_position_for_an_entry_that_filled_blind(run_id):
+    """The order filled, but we timed out before recording a position.
+
+    Real inventory with no stop and no ladder is the worst state to be in, so
+    reconciliation must rebuild the position from the stored fills and the
+    intent's frozen structural stop -- and re-attach protection.
+    """
+    venue = PaperVenue(faults=Faults(place_timeout=True, get_order_timeout=True))
+    w = await make_worker(run_id, venue=venue)
+    action, _, note = await w._handle_candidate(INST, candidate())
+    assert action == "WAIT" and note["execution"]["position_id"] is None
+
+    # Restart against the SAME venue, which can now answer.
+    venue.faults = Faults()
+    from agentic_trade.execution.order_manager import OrderManager
+    from agentic_trade.execution.reconcile import Reconciler
+    report = await Reconciler(venue, OrderManager(venue, run_id), run_id).run()
+
+    assert report.positions_rebuilt == 1
+    async with pool.ledger().acquire() as con:
+        pos = await con.fetchrow(
+            "SELECT * FROM positions WHERE run_id=$1", run_id)
+    assert pos is not None
+    assert pos["status"] == "OPEN"
+    assert pos["initial_stop_px"] == D("98")        # the intent's frozen stop
+    assert pos["qty_open"] == pos["initial_qty"] > 0
+    # and it is protected again
+    assert await venue.get_algo_orders(INST)
 
 
 async def test_partial_entry_opens_position_sized_to_actual_fill(run_id):

@@ -1,0 +1,83 @@
+# Single compose project on the VPS: db + worker + api share one network, so the
+# worker reaches Postgres as `db:5432` with no SSH tunnel.
+#
+# The worker is the SINGLE owner of the order path. Never run a second worker
+# (including a local dev one) against this database.
+services:
+  db:
+    image: postgres:17-alpine
+    container_name: agentic-trade-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: agentic
+      POSTGRES_DB: agentic_trade
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?required}
+      TZ: UTC
+    ports:
+      - '127.0.0.1:5433:5432'
+    volumes:
+      - agentic_trade_pgdata:/var/lib/postgresql/data
+    command:
+      - postgres
+      - -c
+      - max_connections=60
+      - -c
+      - shared_buffers=512MB
+      - -c
+      - work_mem=16MB
+      - -c
+      - timezone=UTC
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U agentic -d agentic_trade']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  worker:
+    build: ./app
+    image: agentic-trade:latest
+    container_name: agentic-trade-worker
+    restart: unless-stopped
+    env_file: [./.env.app]
+    environment:
+      DATABASE_URL: postgresql://agentic:${POSTGRES_PASSWORD:?required}@db:5432/agentic_trade
+    depends_on:
+      db: {condition: service_healthy}
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '5'}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  api:
+    image: agentic-trade:latest
+    container_name: agentic-trade-api
+    restart: unless-stopped
+    command: ['uvicorn', 'agentic_trade.api.main:app',
+              '--host', '0.0.0.0', '--port', '8000', '--log-level', 'warning']
+    env_file: [./.env.app]
+    environment:
+      DATABASE_URL: postgresql://agentic:${POSTGRES_PASSWORD:?required}@db:5432/agentic_trade
+    ports:
+      # Localhost-only. Reach it with: ssh -L 8002:127.0.0.1:8002 <vps>
+      - '127.0.0.1:8002:8000'
+    depends_on:
+      db: {condition: service_healthy}
+      worker: {condition: service_started}
+    logging:
+      driver: json-file
+      options: {max-size: '10m', max-file: '3'}
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  agentic_trade_pgdata:
+    name: agentic_trade_pgdata

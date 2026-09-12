@@ -1,0 +1,12 @@
+.git
+.venv
+node_modules
+vendor/atk/node_modules
+dashboard/node_modules
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+tests
+.env
+*.log

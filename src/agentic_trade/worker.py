@@ -24,6 +24,7 @@ from .config import Settings, get_settings
 from .db import pool
 from .execution.order_manager import OrderManager, ReservationDenied
 from .execution.position import open_position
+from .execution.reconcile import Reconciler
 from .execution.venue import AtkVenue, PaperVenue, Venue
 from .features.compute import compute_snapshot, load_closed_candles
 from .ingest.market import VENUE, MarketIngestor
@@ -58,6 +59,8 @@ class Worker:
         self._equity_is_real = False
         self._venue: Venue | None = None
         self._om: OrderManager | None = None
+        # Set only once startup reconciliation agrees the ledger with the venue.
+        self._reconciled = False
         # One worker owns the order path; this serialises entry attempts.
         self._trade_lock = asyncio.Lock()
 
@@ -91,6 +94,17 @@ class Worker:
         else:
             self._venue = PaperVenue(fee_rate=self._taker_fee)
         self._om = OrderManager(self._venue, self._run_id)
+
+        # Reconcile before anything can trade. In observe mode we still run it,
+        # so the dashboard shows the true state, but nothing would trade anyway.
+        report = await Reconciler(self._venue, self._om, self._run_id).run()
+        self._reconciled = report.is_clean
+        if not report.is_clean:
+            log.error("worker.reconcile_unclean", unresolved=report.unresolved,
+                      detail="new entries are blocked until this is resolved")
+        elif report.unprotected_positions:
+            log.error("worker.unprotected_positions",
+                      positions=report.unprotected_positions)
 
     async def _load_instrument_specs(self) -> None:
         """Lot/tick/min come from the venue, never from hardcoded constants."""
@@ -207,6 +221,7 @@ class Worker:
         gate_result = await gate.evaluate(
             inst_id, mode=self._s.mode, equity=self._equity,
             equity_is_real=self._equity_is_real, run_id=self._run_id,
+            reconciled=self._reconciled,
             limits=gate.GateLimits(
                 max_concurrent_positions=self._s.max_concurrent_positions),
         )

@@ -93,6 +93,12 @@ class Venue(Protocol):
         client_order_id: str,
     ) -> str: ...
 
+    async def get_balances(self) -> dict[str, Decimal]: ...
+
+    async def get_open_orders(self, inst_id: str | None = None) -> list[OrderState]: ...
+
+    async def get_algo_orders(self, inst_id: str) -> list[dict]: ...
+
 
 # ----------------------------------------------------------------- live ------
 class AtkVenue:
@@ -211,6 +217,62 @@ class AtkVenue:
         return payload["data"]["data"][0].get("algoId", "")
 
 
+    async def get_balances(self) -> dict[str, Decimal]:
+        """Available balance per currency, as the venue sees it.
+
+        This is ground truth for reconciliation: the local ledger can be wrong,
+        the exchange's view of what we hold cannot.
+        """
+        try:
+            payload = await self._atk.call("account_get_balance", {})
+        except AtkTimeout as exc:
+            raise VenueUnknown(f"get_balances timed out: {exc}") from exc
+        except AtkError as exc:
+            raise VenueUnknown(f"get_balances failed: {exc}") from exc
+        out: dict[str, Decimal] = {}
+        rows = payload["data"]["data"]
+        if not rows:
+            return out
+        for d in rows[0].get("details") or []:
+            # availBal excludes amounts locked by resting orders; eq is the total.
+            out[d["ccy"]] = Decimal(d.get("eq") or 0)
+        return out
+
+    async def get_open_orders(self, inst_id: str | None = None) -> list[OrderState]:
+        args: dict = {"status": "open"}
+        if inst_id:
+            args["instId"] = inst_id
+        try:
+            payload = await self._atk.call("spot_get_orders", args)
+        except AtkTimeout as exc:
+            raise VenueUnknown(f"get_open_orders timed out: {exc}") from exc
+        except AtkError as exc:
+            raise VenueUnknown(f"get_open_orders failed: {exc}") from exc
+        out = []
+        for r in payload["data"]["data"]:
+            out.append(OrderState(
+                client_order_id=r.get("clOrdId") or "",
+                exchange_order_id=r.get("ordId"),
+                inst_id=r.get("instId", ""), side=r.get("side", ""),
+                status=_map_status(r.get("state", "")),
+                qty_requested=Decimal(r.get("sz") or 0),
+                qty_filled=Decimal(r.get("accFillSz") or 0),
+                avg_px=Decimal(r["avgPx"]) if r.get("avgPx") else None, raw=r,
+            ))
+        return out
+
+    async def get_algo_orders(self, inst_id: str) -> list[dict]:
+        """Pending TP/SL (algo) orders -- i.e. whether protection is still live."""
+        try:
+            payload = await self._atk.call(
+                "spot_get_algo_orders", {"instId": inst_id, "ordType": "oco"})
+        except AtkTimeout as exc:
+            raise VenueUnknown(f"get_algo_orders timed out: {exc}") from exc
+        except AtkError as exc:
+            raise VenueUnknown(f"get_algo_orders failed: {exc}") from exc
+        return payload["data"]["data"]
+
+
 def _map_status(state: str) -> OrdStatus:
     return {
         "live": OrdStatus.LIVE,
@@ -233,6 +295,7 @@ class Faults:
     fill_ratio: Decimal = Decimal(1)   # portion of qty that fills
     duplicate_fills: bool = False      # same fill reported twice
     get_order_timeout: bool = False
+    balances_timeout: bool = False
 
 
 @dataclass
@@ -243,6 +306,8 @@ class PaperVenue:
     faults: Faults = field(default_factory=Faults)
     _orders: dict[str, OrderState] = field(default_factory=dict)
     _fills: dict[str, list[Fill]] = field(default_factory=dict)
+    _algos: dict[str, list[dict]] = field(default_factory=dict)
+    balances: dict[str, Decimal] = field(default_factory=dict)
     _seq: int = 0
     placed_calls: int = 0
     # Per-instance prefix: ids must stay unique across runs, since they are
@@ -273,12 +338,22 @@ class PaperVenue:
                         px_limit if filled > 0 else None)
         self._orders[client_order_id] = st
         if filled > 0:
+            fee = filled * px_limit * self.fee_rate
             f = Fill(self._next("fill"), client_order_id, exch, inst_id, side,
-                     px_limit, filled, filled * px_limit * self.fee_rate, "USDT",
-                     "T", datetime.now(UTC))
+                     px_limit, filled, fee, "USDT", "T", datetime.now(UTC))
             self._fills.setdefault(client_order_id, []).append(f)
             if self.faults.duplicate_fills:
                 self._fills[client_order_id].append(f)   # same fill_id twice
+            # Move inventory, so get_balances() reflects what a fill actually
+            # did. A simulator that reports stale balances would make
+            # reconciliation "discover" positions that closed but did not.
+            base, quote = inst_id.split("-", 1)
+            if side == "buy":
+                self._credit(base, filled)
+                self._credit(quote, -(filled * px_limit + fee))
+            else:
+                self._credit(base, -filled)
+                self._credit(quote, filled * px_limit - fee)
 
         if self.faults.place_timeout:
             # The order IS live at the venue, but the caller never learns the id.
@@ -313,4 +388,24 @@ class PaperVenue:
         client_order_id: str,
     ) -> str:
         await asyncio.sleep(0)
-        return self._next("algo")
+        algo_id = self._next("algo")
+        self._algos.setdefault(inst_id, []).append(
+            {"algoId": algo_id, "algoClOrdId": client_order_id, "sz": str(qty),
+             "state": "live"})
+        return algo_id
+
+    def _credit(self, ccy: str, amount: Decimal) -> None:
+        self.balances[ccy] = self.balances.get(ccy, Decimal(0)) + amount
+
+    async def get_balances(self) -> dict[str, Decimal]:
+        if self.faults.balances_timeout:
+            raise VenueUnknown("paper: get_balances timed out")
+        return {k: v for k, v in self.balances.items() if v != 0}
+
+    async def get_open_orders(self, inst_id: str | None = None) -> list[OrderState]:
+        return [o for o in self._orders.values()
+                if o.status not in TERMINAL
+                and (inst_id is None or o.inst_id == inst_id)]
+
+    async def get_algo_orders(self, inst_id: str) -> list[dict]:
+        return list(self._algos.get(inst_id, []))

@@ -13,6 +13,17 @@ const PASS_CODES = new Set(['RECLAIM_CONFIRMED'])
 const fmt = (v, d = 2) =>
   v === null || v === undefined ? '—' : Number(v).toFixed(d)
 
+/* Quantities arrive as full-precision decimals (e.g. "0.009945000000000000",
+   "0E-18"). Trim to something readable without inventing or hiding precision. */
+const qty = (v) => {
+  if (v === null || v === undefined) return '—'
+  const n = Number(v)
+  if (!Number.isFinite(n)) return String(v)
+  if (n === 0) return '0'
+  const d = n >= 1 ? 4 : 8
+  return n.toFixed(d).replace(/\.?0+$/, '')
+}
+
 /* Prices arrive as full-precision decimal strings; show a readable number of
    significant digits without implying more precision than the tick size. */
 const price = (v) => {
@@ -57,6 +68,19 @@ function StatusStrip({ status }) {
       <span className={`pill ${running ? 'ok' : 'bad'}`}>
         worker {running ? 'running' : 'stopped'}
       </span>
+      {/* Until reconciliation is clean the gate refuses every entry. */}
+      {status.reconcile && (
+        <span className={`pill ${status.reconcile.clean ? 'ok' : 'bad'}`}>
+          {status.reconcile.clean
+            ? 'reconciled'
+            : `UNRECONCILED (${(status.reconcile.unresolved ?? []).length})`}
+        </span>
+      )}
+      {status.reconcile?.unprotected_positions?.length > 0 && (
+        <span className="pill bad">
+          {status.reconcile.unprotected_positions.length} UNPROTECTED
+        </span>
+      )}
     </div>
   )
 }
@@ -134,7 +158,7 @@ function Positions({ data }) {
           <div className="kv">
             <div><div className="k">entry</div><div className="v">{price(p.avg_entry_px)}</div></div>
             <div><div className="k">stop</div><div className="v">{price(p.current_stop_px ?? p.initial_stop_px)}</div></div>
-            <div><div className="k">qty open</div><div className="v">{p.qty_open}</div></div>
+            <div><div className="k">qty open</div><div className="v">{qty(p.qty_open)}</div></div>
             <div><div className="k">realized R</div><div className="v">{p.realized_r ?? '—'}</div></div>
             <div><div className="k">realized pnl</div><div className="v">{price(p.realized_pnl)}</div></div>
             <div><div className="k">fees</div><div className="v">{price(p.fees_paid)}</div></div>
@@ -167,7 +191,7 @@ function Positions({ data }) {
                   <td className={o.status === 'REJECTED' || o.status === 'UNKNOWN' ? 'code' : ''}>
                     {o.status}
                   </td>
-                  <td>{o.qty_filled}/{o.qty_requested}</td>
+                  <td>{qty(o.qty_filled)}/{qty(o.qty_requested)}</td>
                   <td>{o.avg_px ? price(o.avg_px) : '—'}</td>
                 </tr>
               ))}

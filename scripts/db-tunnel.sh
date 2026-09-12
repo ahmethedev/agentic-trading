@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# SSH tunnel to the VPS-hosted agentic-trade Postgres (bound to 127.0.0.1:5433 there).
-# The DB is never exposed publicly; local dev reaches it only through this tunnel.
+# SSH tunnels to the VPS-hosted services, both bound to 127.0.0.1 there:
+#   5433 -> Postgres
+#   8002 -> dashboard + API
+# Neither is exposed publicly; they are reachable only through this tunnel.
 set -euo pipefail
 VPS="${VPS_HOST:-ahmet@38.242.243.245}"
 LOCAL_PORT="${LOCAL_PORT:-5433}"
+API_PORT="${API_PORT:-8002}"
 
 case "${1:-up}" in
   up)
@@ -11,8 +14,9 @@ case "${1:-up}" in
       echo "tunnel already up on :$LOCAL_PORT"; exit 0
     fi
     ssh -f -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 \
-        -L "${LOCAL_PORT}:127.0.0.1:5433" "$VPS"
-    echo "tunnel up: localhost:${LOCAL_PORT} -> ${VPS}:5433"
+        -L "${LOCAL_PORT}:127.0.0.1:5433" \
+        -L "${API_PORT}:127.0.0.1:8002" "$VPS"
+    echo "tunnel up: localhost:${LOCAL_PORT} -> db, localhost:${API_PORT} -> dashboard"
     ;;
   down)
     pkill -f "L ${LOCAL_PORT}:127.0.0.1:5433" 2>/dev/null || true

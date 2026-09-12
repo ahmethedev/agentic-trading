@@ -10,15 +10,21 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from ..config import get_settings
 from ..db import pool
 
 VENUE = "okx-tr"
+# Built dashboard, present in the deployed image; absent during local dev where
+# Vite serves it instead.
+DASHBOARD_DIST = Path(__file__).resolve().parents[3] / "dashboard" / "dist"
 
 
 @asynccontextmanager
@@ -54,6 +60,14 @@ async def status() -> dict[str, Any]:
             """SELECT ts, severity, kind, inst_id, detail FROM ops_events
                ORDER BY ts DESC LIMIT 20"""
         )
+        # Latest startup reconciliation for THIS run: until it is clean, no
+        # entry can be opened, so it belongs in the status strip.
+        recon = await con.fetchrow(
+            """SELECT ts, detail FROM ops_events
+               WHERE kind='startup_reconcile' AND run_id=$1
+               ORDER BY ts DESC LIMIT 1""",
+            run["run_id"] if run else None,
+        )
     async with pool.market().acquire() as con:
         freshness = await con.fetch(
             """SELECT inst_id,
@@ -78,6 +92,10 @@ async def status() -> dict[str, Any]:
         "risk_fraction": str(s.risk_fraction),
         "risk_fraction_max": str(s.risk_fraction_max),
         "gaps_last_hour": gaps,
+        "reconcile": (
+            {"ts": recon["ts"].isoformat(), **_j(recon["detail"])}
+            if recon else None
+        ),
         "data_freshness": [
             {
                 "inst_id": r["inst_id"],
@@ -294,3 +312,14 @@ async def instruments() -> list[dict[str, Any]]:
          "lot_sz": str(r["lot_sz"]), "min_sz": str(r["min_sz"]), "state": r["state"]}
         for r in rows
     ]
+
+
+# --- static dashboard ---------------------------------------------------------
+# Mounted last so every /api route above wins over the SPA catch-all.
+if DASHBOARD_DIST.is_dir():
+    app.mount("/assets", StaticFiles(directory=DASHBOARD_DIST / "assets"),
+              name="assets")
+
+    @app.get("/")
+    async def index() -> FileResponse:
+        return FileResponse(DASHBOARD_DIST / "index.html")

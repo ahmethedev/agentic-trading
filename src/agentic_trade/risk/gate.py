@@ -38,6 +38,7 @@ async def evaluate(
     equity: Decimal,
     equity_is_real: bool,
     run_id: int,
+    reconciled: bool = False,
     limits: GateLimits | None = None,
     now: datetime | None = None,
     cutoff: datetime | None = None,
@@ -50,6 +51,11 @@ async def evaluate(
 
     if mode == "observe":
         codes.append("OBSERVE_MODE_NO_ORDERS")
+
+    # No entry may be opened until startup reconciliation has agreed the ledger
+    # with the venue. A restart mid-order otherwise risks a duplicate position.
+    if not reconciled:
+        codes.append("RECONCILE_INCOMPLETE")
 
     if not equity_is_real:
         codes.append("EQUITY_NOT_VERIFIED")
