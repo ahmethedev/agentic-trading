@@ -67,7 +67,9 @@ DATABASE_URL=... .venv/bin/python -m pytest tests/ -q        # 62 tests
 
 `MODE` controls the order path: `observe` never sends an order, `paper` runs the
 identical state machine against a simulated venue, `live` sends real orders. The
-tests cover `observe` and `paper`; `live` has never been exercised.
+tests cover `observe` and `paper`. `MODE=live` is running on the VPS, but no live
+order has been sent yet — every order in the ledger so far came from
+`scripts/paper_demo.py`.
 
 `MAX_ENTRIES_PER_RUN` caps how many entries one run may **open** — `0` is unlimited,
 `1` arms exactly one. It is checked in the risk gate (so the funnel shows
@@ -222,20 +224,24 @@ fills, and the structural stop and policy version from the durable intent row.
 
 ## Supervised first entry
 
-`MODE=live` has never run. The first real order should be watched, not discovered
+No live order has been sent yet. The first one should be watched, not discovered
 unattended, so the run is *armed* for exactly one entry:
 
 ```
 MODE=live
 MAX_ENTRIES_PER_RUN=1
-ENTRY_INSTRUMENTS=BTC-USDT
+ENTRY_INSTRUMENTS=            # empty = every ingested pair is armed
 ```
 
-The worker then sends at most one entry, on one pair, for the life of that run. After it is
-reserved, every further candidate is refused with `ENTRY_BUDGET_EXHAUSTED` and the
-reason appears in the decision funnel. Restarting the worker starts a new run and
-re-arms the budget — arming is per run, deliberately, so a restart is an explicit
-decision to allow another entry.
+The worker then sends at most one entry for the life of that run. All three ingested
+pairs are candidates and compete for that single slot — whichever confirms first
+takes it. After it is reserved, every further candidate is refused with
+`ENTRY_BUDGET_EXHAUSTED` and the reason appears in the decision funnel. Restarting
+the worker starts a new run and re-arms the budget — arming is per run,
+deliberately, so a restart is an explicit decision to allow another entry.
+
+`MAX_CONCURRENT_POSITIONS=1` binds alongside it: widening `ENTRY_INSTRUMENTS` widens
+which pair may be chosen, never how many positions may be open at once.
 
 Watch it with:
 
