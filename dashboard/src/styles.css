@@ -887,6 +887,32 @@ main {
   font-size: 13px;
   margin-top: 20px !important;
 }
+/* Live tool stages while an answer is being written, and the recorded trace
+   afterwards. Both name real calls, so status never outlives the work. */
+.stages {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.stages li::before {
+  content: "→ ";
+}
+.tool-trace {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 11px;
+  line-height: 18px;
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+}
+.tool-trace li.failed {
+  color: var(--negative);
+}
+.warn-note {
+  color: var(--warning);
+  margin-top: 8px;
+}
 .new-reply {
   background: var(--primary-soft) !important;
   color: var(--primary) !important;

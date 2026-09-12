@@ -50,6 +50,8 @@ DATABASE_URL=postgresql://agentic:...@127.0.0.1:5433/agentic_trade
 MODE=observe                  # observe | paper | live
 MAX_ENTRIES_PER_RUN=0         # 0 = unlimited; 1 arms a single supervised entry
 ENTRY_INSTRUMENTS=            # empty = all; e.g. BTC-USDT restricts entries only
+ANTHROPIC_API_KEY=            # optional; without it the chat uses the reader
+LLM_MODEL=claude-haiku-4-5    # cheapest current model; claude-opus-5 reasons harder
 ```
 
 ## Run
@@ -190,7 +192,8 @@ Two ATK behaviours worth knowing:
 ## Safety properties
 
 * Risk engine is deterministic and separate from the model. The LLM cannot size, place,
-  or cancel anything; write tools are reachable only from the order manager.
+  or cancel anything; write tools are reachable only from the order manager. The chat
+  model's entire surface is six read-only queries (see Ask My Quant).
 * Tool allowlist is enforced in code — module selection alone is not treated as a control
   (`--modules spot` would still expose batch order tools).
 * An ATK call timeout is `UNKNOWN`, never "cancelled": write callers must reconcile.
@@ -311,7 +314,31 @@ The product UI replaces the terminal dashboard with market discovery, strategy
 rules, a decision journal and a limited question reader. It reads the existing
 worker/store; no additional trading worker is needed. See
 [implementation status](docs/PRODUCT_PROGRESS.md) for what is and is not connected.
-The question reader is deterministic, not an LLM, and its history is session-only.
+### Ask My Quant
+
+With `ANTHROPIC_API_KEY` set, the chat is Claude calling six read-only application
+tools over the same services the dashboard renders: `get_market_overview`,
+`get_strategy`, `get_decision_funnel`, `get_risk_summary`, `get_recent_fills`,
+`get_run_status`. The model cannot write: no tool can place, cancel, size, start a
+run or reach the venue, and account tools are both withheld from and refused for a
+session without the operator cookie. Risk and PnL are never computed by the model —
+the tools hand over values the worker already calculated.
+
+Answers stream over SSE (`POST /api/product/ask/stream`), so the UI shows the real
+tool stage while it runs and then the recorded trace: each call, its duration,
+success or failure, plus model, turns and token usage. Without a key — or if the
+model call fails — the chat falls back to the deterministic reader and labels the
+answer with the engine that produced it. History lives in the API process (the DB
+pools stay read-only) and is lost on restart.
+
+```bash
+.venv/bin/python scripts/chat_smoke.py "Piyasanın fotoğrafını çıkar"   # one real call
+.venv/bin/python scripts/chat_smoke.py --operator "Neden işlem açmadık?"
+```
+
+Cost per question is roughly 2–5K input and a few hundred output tokens; on
+`claude-haiku-4-5` ($1/$5 per Mtok) that is well under a cent. Deployment needs
+`ANTHROPIC_API_KEY` in the VPS `.env.app`, which both containers already read.
 
 Market discovery needs no operator login. Private ledger/status/decision endpoints
 now require an operator session. Set a separate, strong `APP_OPERATOR_TOKEN` in the

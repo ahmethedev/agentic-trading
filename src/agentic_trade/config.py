@@ -34,6 +34,25 @@ class Settings(BaseSettings):
     # --- Storage -----------------------------------------------------------
     database_url: str = Field(alias="DATABASE_URL")
 
+    # --- Chat model (Ask My Quant) -----------------------------------------
+    # The model reads through the same read-only product services the UI uses.
+    # It never sizes, prices or places anything: those stay in the deterministic
+    # worker (AGENT.md §9). Without a key the chat falls back to the built-in
+    # deterministic reader rather than failing.
+    anthropic_api_key: SecretStr | None = Field(default=None, alias="ANTHROPIC_API_KEY")
+    # Haiku 4.5 is the cheapest current model ($1/$5 per Mtok): this chat reads
+    # prepared numbers and explains them, which does not need a frontier model,
+    # and a hackathon credit lasts thousands of questions. Set LLM_MODEL to
+    # claude-opus-5 for harder reasoning. Note that `effort` is not accepted on
+    # Haiku, so it is sent only for the models that support it (product/llm.py).
+    llm_model: str = Field(default="claude-haiku-4-5", alias="LLM_MODEL")
+    llm_effort: str = Field(default="medium", alias="LLM_EFFORT")
+    llm_max_tokens: int = Field(default=2000, alias="LLM_MAX_TOKENS")
+    # Model calls per question: 1 to pick tools, 1 to answer, plus headroom for
+    # a follow-up lookup. Bounded so one question cannot loop up a bill.
+    llm_max_turns: int = Field(default=4, alias="LLM_MAX_TURNS")
+    llm_timeout_s: float = Field(default=60.0, alias="LLM_TIMEOUT_S")
+
     # --- Trading mode ------------------------------------------------------
     # observe: no orders at all. paper: simulated fills. live: real orders.
     mode: str = Field(default="observe", alias="MODE")
@@ -54,6 +73,14 @@ class Settings(BaseSettings):
     # or interrupts the observe-mode record.
     entry_instruments: str = Field(default="", alias="ENTRY_INSTRUMENTS")
 
+    @field_validator("llm_effort")
+    @classmethod
+    def _effort(cls, v: str) -> str:
+        allowed = {"low", "medium", "high", "xhigh", "max"}
+        if v not in allowed:
+            raise ValueError(f"LLM_EFFORT must be one of {sorted(allowed)}, got {v!r}")
+        return v
+
     @field_validator("mode")
     @classmethod
     def _mode(cls, v: str) -> str:
@@ -67,6 +94,11 @@ class Settings(BaseSettings):
         """Instruments entries are allowed on, or None for no restriction."""
         names = {p.strip() for p in self.entry_instruments.split(",") if p.strip()}
         return frozenset(names) or None
+
+    @property
+    def llm_enabled(self) -> bool:
+        """True when the chat can reach Claude; otherwise the reader answers."""
+        return self.anthropic_api_key is not None
 
     @property
     def has_credentials(self) -> bool:

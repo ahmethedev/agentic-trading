@@ -57,7 +57,7 @@ async def product_boundary(request: Request, call_next):
             return JSONResponse({"detail": "Origin başlığı gerekli."}, status_code=403)
         public = {"/api/candles", "/api/instruments", "/api/flow",
                   "/api/product/market", "/api/product/strategy", "/api/product/session",
-                  "/api/product/ask"}
+                  "/api/product/ask", "/api/product/ask/stream"}
         if request.url.path not in public and not authorised(request):
             return JSONResponse({"detail": "Operatör oturumu gerekli."}, status_code=401)
     try:

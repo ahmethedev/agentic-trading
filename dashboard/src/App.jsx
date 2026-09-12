@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import Chart from "./Chart.jsx";
 import {
   askQuant,
+  askQuantStream,
   getCandles,
   getMarket,
   getSession,
@@ -38,6 +39,14 @@ const views = [
   { id: "strategies", name: "Stratejiler", icon: "strategy" },
   { id: "experiments", name: "Deneyler", icon: "experiment" },
 ];
+const toolLabels = {
+  get_market_overview: "Piyasa görünümü",
+  get_strategy: "Strateji sürümü",
+  get_decision_funnel: "Karar kayıtları",
+  get_risk_summary: "Risk ve maliyet",
+  get_recent_fills: "Gerçekleşen işlemler",
+  get_run_status: "Çalışma durumu",
+};
 const prompts = [
   "Piyasanın fotoğrafını çıkar",
   "Neden işlem açmadık?",
@@ -215,10 +224,12 @@ function DecisionList({ data }) {
     </div>
   );
 }
-function Chat({ selected, onNavigate, opened, onClose }) {
+function Chat({ selected, onNavigate, opened, onClose, assistant }) {
   const [draft, setDraft] = useState(""),
     [messages, setMessages] = useState([]),
     [busy, setBusy] = useState(false);
+  const [stage, setStage] = useState(null);
+  const conversation = useRef(null);
   const [newReply, setNewReply] = useState(false);
   const [compact, setCompact] = useState(window.innerWidth < 1200);
   useEffect(() => {
@@ -247,11 +258,28 @@ function Chat({ selected, onNavigate, opened, onClose }) {
     if (nearBottom.current) scroll();
     else setNewReply(true);
   }, [messages, busy]);
+  // The answer is written into the last assistant message as it arrives, so
+  // the reply appears progressively instead of after a silent wait.
+  const patchLast = (fields) =>
+    setMessages((m) =>
+      m.map((msg, i) =>
+        i === m.length - 1 && msg.role === "assistant"
+          ? { ...msg, ...(typeof fields === "function" ? fields(msg) : fields) }
+          : msg,
+      ),
+    );
+
   async function send(text) {
     if (inFlight.current || !text.trim()) return;
     inFlight.current = true;
     setBusy(true);
+    setStage(null);
     setDraft("");
+    const question = {
+      message: text,
+      inst_id: selected || null,
+      conversation_id: conversation.current,
+    };
     setMessages((m) => [
       ...m,
       {
@@ -261,13 +289,36 @@ function Chat({ selected, onNavigate, opened, onClose }) {
           ? "İzlenen pariteler"
           : selected || "İzlenen pariteler",
       },
+      { role: "assistant", text: "", streaming: true, stages: [] },
     ]);
     try {
-      const answer = await askQuant(text, selected || null);
-      setMessages((m) => [...m, { role: "assistant", ...answer }]);
+      let answer;
+      try {
+        answer = await askQuantStream(question, (event) => {
+          if (event.type === "text")
+            patchLast((msg) => ({ text: msg.text + event.delta }));
+          else if (event.type === "text_reset") patchLast({ text: "" });
+          else if (event.type === "tool" && event.phase === "start") {
+            setStage(event.stage);
+            patchLast((msg) => ({ stages: [...msg.stages, event.stage] }));
+          } else if (event.type === "tool" && event.phase === "end")
+            setStage(null);
+        });
+      } catch (streamError) {
+        // A proxy or browser that will not stream must not cost the answer.
+        if (streamError.message.includes("(4")) throw streamError;
+        patchLast({ text: "", stages: [] });
+        answer = await askQuant(text, selected || null, conversation.current);
+      }
+      conversation.current = answer.conversation_id || conversation.current;
+      patchLast({ ...answer, streaming: false });
     } catch (error) {
-      setMessages((m) => [...m, { role: "error", text: error.message }]);
+      setMessages((m) => [
+        ...m.filter((msg, i) => !(i === m.length - 1 && msg.streaming)),
+        { role: "error", text: error.message },
+      ]);
     } finally {
+      setStage(null);
       inFlight.current = false;
       setBusy(false);
     }
@@ -340,8 +391,9 @@ function Chat({ selected, onNavigate, opened, onClose }) {
           ))}
         </div>
         <p className="fine reader-note">
-          İlk sürüm: sınırlı sorgu asistanı. LLM bağlı değil; konuşma bu sayfa
-          oturumunda tutulur.
+          {assistant?.enabled
+            ? `${assistant.label} · uygulama araçlarıyla kendi kayıtlarını okur. Konuşma sunucu oturumunda tutulur, yeniden başlatınca silinir.`
+            : "İlk sürüm: sınırlı sorgu asistanı. LLM bağlı değil; konuşma bu sayfa oturumunda tutulur."}
         </p>
         <div aria-live="polite" aria-relevant="additions">
           {messages.map((m, i) => (
@@ -354,23 +406,59 @@ function Chat({ selected, onNavigate, opened, onClose }) {
                     : "My Quant"}
               </span>
               <p>{m.text}</p>
-              {m.tool && (
+              {m.streaming && m.stages?.length > 0 && (
+                <ul className="stages">
+                  {m.stages.map((s, j) => (
+                    <li key={j}>{s}…</li>
+                  ))}
+                </ul>
+              )}
+              {m.fallback && <p className="fine warn-note">{m.fallback}</p>}
+              {m.truncated && (
+                <p className="fine warn-note">
+                  Cevap ayrılan sınırda kesildi; soruyu daraltmak sonucu
+                  iyileştirir.
+                </p>
+              )}
+              {m.tool && !m.streaming && (
                 <>
                   <details className="evidence">
                     <summary>Kaynağı gör · {m.duration_ms} ms</summary>
                     <p>
-                      Uygulama aracı: {m.tool}
-                      <br />
                       {stamp(m.as_of)}
                       <br />
                       Kaynak: mevcut PostgreSQL kayıtları.
+                      <br />
+                      Motor: {m.engine}
+                      {m.effort ? ` · effort ${m.effort}` : ""}
                     </p>
+                    {m.calls?.length > 0 ? (
+                      <ol className="tool-trace">
+                        {m.calls.map((c, j) => (
+                          <li key={j} className={c.ok ? "ok" : "failed"}>
+                            {toolLabels[c.name] || c.name} · {c.duration_ms} ms ·{" "}
+                            {c.ok ? "başarılı" : "hata"}
+                          </li>
+                        ))}
+                      </ol>
+                    ) : (
+                      <p>Uygulama aracı: {m.tool}</p>
+                    )}
                     {m.data?.run && (
                       <p>
                         Run #{m.data.run.run_id} · {modeLabel(m.data.run)}
                       </p>
                     )}
-                    <p>Motor: {m.engine}</p>
+                    {m.usage && (
+                      <p>
+                        Token: {m.usage.input_tokens} girdi ·{" "}
+                        {m.usage.output_tokens} çıktı
+                        {m.usage.cache_read_input_tokens > 0
+                          ? ` · ${m.usage.cache_read_input_tokens} cache`
+                          : ""}
+                        {m.turns > 1 ? ` · ${m.turns} model turu` : ""}
+                      </p>
+                    )}
                   </details>
                   <button
                     className="text-button"
@@ -389,7 +477,7 @@ function Chat({ selected, onNavigate, opened, onClose }) {
         </div>
         {busy && (
           <p className="query-status" role="status">
-            Kayıtlar sorgulanıyor…
+            {stage ? `${stage}…` : "Soru değerlendiriliyor…"}
           </p>
         )}
       </div>
@@ -1073,6 +1161,7 @@ export default function App() {
             </footer>
           </main>
           <Chat
+            assistant={session?.assistant}
             selected={selected}
             opened={chatOpen}
             onClose={closeChat}
