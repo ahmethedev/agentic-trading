@@ -85,7 +85,8 @@ def test_no_available_balance_rejects():
     """Equity on the books but nothing spendable cannot produce an order."""
     with pytest.raises(RiskRejection) as e:
         compute_size(mk(equity_quote=D("1000"), available_quote=D("0")))
-    assert e.value.code in {"QTY_ROUNDS_TO_ZERO", "BELOW_MIN_SIZE"}
+    assert e.value.code in {"QTY_ROUNDS_TO_ZERO", "BELOW_MIN_SIZE",
+                            "BELOW_MIN_SIZE_BALANCE"}
 
 
 def test_stop_above_entry_rejected():
@@ -94,12 +95,55 @@ def test_stop_above_entry_rejected():
     assert e.value.code == "STOP_NOT_BELOW_ENTRY"
 
 
-def test_below_min_size_rejected_not_rounded_up():
-    """Reaching the venue minimum must never be achieved by taking more risk."""
-    spec = InstrumentSpec("T", lot_sz=D("0.001"), min_sz=D("1"), tick_sz=D("0.1"))
+# --------------------------------------------------------- venue minimum ----
+# A risk-implied quantity below the venue minimum used to end the trade, full
+# stop. On a small account that is most setups, so an approved idea never became
+# an entry. The minimum may now be taken -- but only while its risk still fits
+# inside RISK_FRACTION_MAX, the number that actually bounds a loss.
+MIN_SPEC = InstrumentSpec("T", lot_sz=D("0.001"), min_sz=D("1"), tick_sz=D("0.1"))
+
+
+def test_min_size_uplift_is_bounded_by_the_hard_ceiling():
+    """1% of 100 buys 0.5 units; the venue minimum of 1 costs 2% -- the cap."""
+    r = compute_size(mk(spec=MIN_SPEC, equity_quote=D("100"),
+                        available_quote=D("100")))
+    assert r.quantity == D("1")
+    assert "MIN_SIZE_UPLIFT" in r.capped_by
+    assert r.risk_at_stop > r.risk_budget, "this is the point: it costs more"
+    assert r.risk_at_stop <= r.risk_ceiling, "but never more than the hard cap"
+
+
+def test_min_size_uplift_refused_when_it_breaches_the_ceiling():
+    """A minimum lot that risks more than RISK_FRACTION_MAX is simply not taken."""
     with pytest.raises(RiskRejection) as e:
-        compute_size(mk(spec=spec, equity_quote=D("100"), available_quote=D("100")))
+        # Same minimum, half the equity -> the ceiling halves, the lot does not.
+        compute_size(mk(spec=MIN_SPEC, equity_quote=D("50"),
+                        available_quote=D("100")))
+    assert e.value.code == "BELOW_MIN_SIZE_RISK"
+
+
+def test_min_size_uplift_refused_when_the_balance_cannot_pay_for_it():
+    """Capital, not risk, is the binding constraint -- and it must say so."""
+    with pytest.raises(RiskRejection) as e:
+        compute_size(mk(spec=MIN_SPEC, equity_quote=D("1000"),
+                        available_quote=D("50")))
+    assert e.value.code == "BELOW_MIN_SIZE_BALANCE"
+
+
+def test_min_size_uplift_can_be_switched_off():
+    """The strict behaviour stays one flag away."""
+    with pytest.raises(RiskRejection) as e:
+        compute_size(mk(spec=MIN_SPEC, equity_quote=D("100"),
+                        available_quote=D("100"),
+                        allow_min_size_uplift=False))
     assert e.value.code == "BELOW_MIN_SIZE"
+
+
+def test_uplift_never_exceeds_the_ceiling_across_stop_widths():
+    for stop in ("99.9", "99", "98", "96"):
+        r = compute_size(mk(spec=MIN_SPEC, equity_quote=D("1000"),
+                            available_quote=D("1000"), structural_stop=D(stop)))
+        assert r.risk_at_stop <= r.risk_ceiling
 
 
 def test_fees_reduce_quantity():

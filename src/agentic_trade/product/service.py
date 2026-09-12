@@ -36,6 +36,8 @@ REASONS = {
     "RECONCILE_INCOMPLETE": "Emir ve hesap mutabakatı tamamlanmadı",
     "OBSERVE_MODE_NO_ORDERS": "Gözlem modu emir göndermez",
     "BELOW_MIN_SIZE": "Risk bütçesine sığan miktar borsanın minimum işlem boyutunun altında",
+    "BELOW_MIN_SIZE_RISK": "Borsanın minimum işlem boyutu bile risk tavanını aşıyor",
+    "BELOW_MIN_SIZE_BALANCE": "Borsanın minimum işlem boyutunu alacak serbest bakiye yok",
     "NO_EQUITY": "Kullanılabilir sermaye yok",
     "EQUITY_NOT_VERIFIED": "Sermaye doğrulanmadı",
     "ENTRY_FILLED": "Giriş emri gerçekleşti",

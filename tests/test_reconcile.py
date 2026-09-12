@@ -9,7 +9,7 @@ import pytest
 from agentic_trade.db import pool
 from agentic_trade.execution.order_manager import OrderManager
 from agentic_trade.execution.reconcile import Reconciler
-from agentic_trade.execution.venue import Faults, PaperVenue
+from agentic_trade.execution.venue import Faults, PaperVenue, VenueRejected
 from agentic_trade.risk import gate
 
 pytestmark = pytest.mark.asyncio(loop_scope="session")
@@ -95,9 +95,9 @@ async def test_order_that_filled_while_down_is_ingested(run_id, decision_id):
 
     report = await Reconciler(venue, om, run_id).run()
     assert report.fills_ingested == 1
-    qty, avg, _ = await om.filled_totals("cidfilled")
-    assert qty == D("0.01")
-    assert avg == D("100")
+    totals = await om.filled_totals("cidfilled")
+    assert totals.qty == D("0.01")
+    assert totals.avg_px == D("100")
     assert await _status(intent_id) == "FILLED"
 
 
@@ -147,22 +147,47 @@ async def test_position_closed_while_down_is_detected(run_id, decision_id):
     assert row["qty_open"] == 0
 
 
-async def test_open_position_without_protection_is_flagged(run_id, decision_id):
+async def _naked_position(run_id, decision_id) -> int:
     intent_id = await _intent(run_id, decision_id, "FILLED")
     async with pool.ledger().acquire() as con:
-        pid = await con.fetchval(
+        return await con.fetchval(
             """INSERT INTO positions (run_id, intent_id, inst_id, status,
                    initial_qty, avg_entry_px, initial_stop_px, frozen_risk_amount,
                    price_r_distance, qty_open, policy_version)
                VALUES ($1,$2,$3,'OPEN',0.01,100,98,0.02,2,0.01,'t')
                RETURNING position_id""", run_id, intent_id, INST)
 
+
+async def test_open_position_without_protection_is_re_armed(run_id, decision_id):
+    """Reconciliation must RE-ARM a naked position, not just report it.
+
+    Two consecutive live runs recorded `reconcile_unprotected` for the same
+    position and then traded on around it. Detection without repair left real
+    money exposed for two and a half hours.
+    """
+    pid = await _naked_position(run_id, decision_id)
     venue = PaperVenue(balances={"BTC": D("0.01"), "USDT": D("5")})
     report = await _rec(venue, run_id).run()
 
-    assert pid in report.unprotected_positions
-    # An unprotected position needs attention but must not stop the worker --
-    # refusing to run would also refuse to manage it.
+    assert report.protection_repaired == [pid]
+    assert report.unprotected_positions == []
+    assert report.is_clean
+    assert await venue.get_algo_orders(INST), "no stop was actually placed"
+
+
+async def test_position_that_cannot_be_re_armed_is_still_flagged(run_id, decision_id):
+    """When the venue keeps refusing, the incident must survive the repair
+    attempt rather than be swallowed by it."""
+    class NoProtect(PaperVenue):
+        async def place_oco(self, *a, **k):
+            raise VenueRejected("ALGO_FAILED", "venue refused")
+
+    pid = await _naked_position(run_id, decision_id)
+    venue = NoProtect(balances={"BTC": D("0.01"), "USDT": D("5")})
+    report = await _rec(venue, run_id).run()
+
+    assert report.unprotected_positions == [pid]
+    # It needs attention, but refusing to run would also refuse to manage it.
     assert report.is_clean
     async with pool.ledger().acquire() as con:
         n = await con.fetchval(

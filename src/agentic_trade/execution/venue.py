@@ -338,22 +338,26 @@ class PaperVenue:
                         px_limit if filled > 0 else None)
         self._orders[client_order_id] = st
         if filled > 0:
-            fee = filled * px_limit * self.fee_rate
+            base, quote = inst_id.split("-", 1)
+            # OKX charges the spot fee in the currency you RECEIVE: a buy pays
+            # in base, a sell pays in quote. Modelling a buy fee in quote was
+            # what hid a live incident -- protection was sized to the filled
+            # quantity, but the fee had already been taken out of the base, so
+            # the OCO was rejected for insufficient balance and the position sat
+            # naked. The simulator must charge it the same way the venue does.
+            if side == "buy":
+                fee, fee_ccy = filled * self.fee_rate, base
+                self._credit(base, filled - fee)
+                self._credit(quote, -(filled * px_limit))
+            else:
+                fee, fee_ccy = filled * px_limit * self.fee_rate, quote
+                self._credit(base, -filled)
+                self._credit(quote, filled * px_limit - fee)
             f = Fill(self._next("fill"), client_order_id, exch, inst_id, side,
-                     px_limit, filled, fee, "USDT", "T", datetime.now(UTC))
+                     px_limit, filled, fee, fee_ccy, "T", datetime.now(UTC))
             self._fills.setdefault(client_order_id, []).append(f)
             if self.faults.duplicate_fills:
                 self._fills[client_order_id].append(f)   # same fill_id twice
-            # Move inventory, so get_balances() reflects what a fill actually
-            # did. A simulator that reports stale balances would make
-            # reconciliation "discover" positions that closed but did not.
-            base, quote = inst_id.split("-", 1)
-            if side == "buy":
-                self._credit(base, filled)
-                self._credit(quote, -(filled * px_limit + fee))
-            else:
-                self._credit(base, -filled)
-                self._credit(quote, filled * px_limit - fee)
 
         if self.faults.place_timeout:
             # The order IS live at the venue, but the caller never learns the id.
@@ -388,6 +392,15 @@ class PaperVenue:
         client_order_id: str,
     ) -> str:
         await asyncio.sleep(0)
+        # A protective sell is a real sell: the venue rejects it outright if the
+        # base is not actually held. Simulating an always-successful OCO is what
+        # let an unsellable size reach production.
+        base = inst_id.split("-", 1)[0]
+        held = self.balances.get(base, Decimal(0))
+        if qty > held:
+            raise VenueRejected(
+                "ALGO_FAILED",
+                f"paper: insufficient {base} balance, have {held}, asked {qty}")
         algo_id = self._next("algo")
         self._algos.setdefault(inst_id, []).append(
             {"algoId": algo_id, "algoClOrdId": client_order_id, "sz": str(qty),

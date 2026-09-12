@@ -23,7 +23,7 @@ from .atk.client import AtkClient, AtkError, AtkTimeout
 from .config import Settings, get_settings
 from .db import pool
 from .execution.order_manager import OrderManager, ReservationDenied
-from .execution.position import open_position
+from .execution.position import open_position, sweep_protection
 from .execution.reconcile import Reconciler
 from .execution.venue import AtkVenue, PaperVenue, Venue
 from .features.compute import compute_snapshot, load_closed_candles
@@ -56,6 +56,12 @@ class Worker:
         self._taker_fee = ASSUMED_TAKER_FEE
         self._fee_is_real = False
         self._equity = Decimal("1000")   # placeholder until account access exists
+        # Equity and spendable balance are DIFFERENT numbers. Equity sets the
+        # risk budget; the free quote balance caps what a spot entry can buy.
+        # Conflating them made the budget collapse to whatever cash happened to
+        # be left after an open position, so every further setup died at
+        # BELOW_MIN_SIZE while 30 USDT of equity sat in the position.
+        self._available_quote = Decimal("1000")
         self._equity_is_real = False
         self._venue: Venue | None = None
         self._om: OrderManager | None = None
@@ -108,9 +114,13 @@ class Worker:
         if not report.is_clean:
             log.error("worker.reconcile_unclean", unresolved=report.unresolved,
                       detail="new entries are blocked until this is resolved")
-        elif report.unprotected_positions:
+        if report.protection_repaired:
+            log.warning("worker.protection_repaired",
+                        positions=report.protection_repaired)
+        if report.unprotected_positions:
             log.error("worker.unprotected_positions",
-                      positions=report.unprotected_positions)
+                      positions=report.unprotected_positions,
+                      detail="re-arming failed; the watchdog will keep trying")
 
     async def _load_instrument_specs(self) -> None:
         """Lot/tick/min come from the venue, never from hardcoded constants."""
@@ -158,19 +168,25 @@ class Worker:
                         missing=self._s.missing_credentials())
             return
         try:
-            bal = await self._atk.call("account_get_balance",
-                                       {"ccy": self._s.quote_ccy})
+            bal = await self._atk.call("account_get_balance", {})
             account = bal["data"]["data"][0]
             details = account.get("details") or []
             # A successful balance read is authoritative even when it reports
             # nothing: an authenticated but unfunded account must NOT silently
             # fall back to the placeholder equity and size against money that
             # does not exist. Absent currency detail means zero.
-            self._equity = Decimal("0")
+            #
+            # Equity is the WHOLE account (totalEq), not the quote balance: an
+            # account that is fully deployed into a position has not become a
+            # poorer account, and a risk budget that shrinks with every fill
+            # would make the next entry unsizeable for the wrong reason.
+            self._equity = Decimal(account.get("totalEq") or 0)
+            self._available_quote = Decimal("0")
             self._equity_is_real = True
             for d in details:
                 if d["ccy"] == self._s.quote_ccy:
-                    self._equity = Decimal(d["eq"])
+                    # availBal excludes anything locked by a resting order.
+                    self._available_quote = Decimal(d.get("availBal") or 0)
             if self._equity <= 0:
                 await self._ops("warn", "account_unfunded", detail={
                     "quote_ccy": self._s.quote_ccy,
@@ -187,6 +203,7 @@ class Worker:
             self._taker_fee = abs(Decimal(taker))
             self._fee_is_real = True
             log.info("worker.account_loaded", equity=str(self._equity),
+                     available_quote=str(self._available_quote),
                      taker_fee=str(self._taker_fee))
         except (AtkError, AtkTimeout, KeyError, IndexError) as exc:
             await self._ops("error", "account_load_failed",
@@ -243,25 +260,38 @@ class Worker:
         # Size regardless, so the decision card shows what WOULD have been taken.
         try:
             sized = compute_size(SizingInput(
-                equity_quote=self._equity, available_quote=self._equity,
+                equity_quote=self._equity,
+                available_quote=self._available_quote,
                 entry_reference=px_limit,
                 structural_stop=result.structural_stop,
                 risk_fraction=self._s.risk_fraction,
                 risk_fraction_max=self._s.risk_fraction_max,
                 taker_fee_rate=self._taker_fee, spec=spec,
+                allow_min_size_uplift=self._s.min_size_uplift,
             ))
             note["sizing"] = {
                 "quantity": str(sized.quantity), "notional": str(sized.notional),
                 "risk_budget": str(sized.risk_budget),
                 "risk_at_stop": str(sized.risk_at_stop),
+                "risk_ceiling": str(sized.risk_ceiling),
                 "price_r_distance": str(sized.price_r_distance),
                 "capped_by": sized.capped_by,
+                "equity": str(self._equity),
+                "available_quote": str(self._available_quote),
                 "equity_is_real": self._equity_is_real,
                 "fee_is_real": self._fee_is_real,
             }
         except RiskRejection as rej:
-            note["sizing"] = {"rejected": rej.code, "detail": rej.detail}
-            return "WAIT", [rej.code], note
+            note["sizing"] = {
+                "rejected": rej.code, "detail": rej.detail,
+                "equity": str(self._equity),
+                "available_quote": str(self._available_quote),
+            }
+            # Report the gate's verdict too. Returning the sizing code alone
+            # made the funnel blame sizing for a trade the gate had already
+            # refused -- e.g. "BELOW_MIN_SIZE" on an instrument that was in fact
+            # blocked by CONCURRENCY_LIMIT.
+            return "WAIT", [rej.code, *gate_result.codes], note
 
         if not gate_result.allowed:
             return "WAIT", gate_result.codes, note
@@ -318,13 +348,21 @@ class Worker:
         if outcome.qty_filled <= 0 or outcome.unknown:
             return outcome, None
 
-        qty, avg_px, fees = await self._om.filled_totals(outcome.client_order_id)
+        totals = await self._om.filled_totals(outcome.client_order_id)
+        foreign = totals.foreign_fee_ccys(inst_id)
+        if foreign:
+            # A fee paid in a third currency (an OKB discount, say) cannot be
+            # valued without a rate we do not have. Say so rather than quietly
+            # under-reporting the cost basis.
+            await self._ops("warn", "fee_currency_unpriced", inst_id=inst_id,
+                            detail={"currencies": foreign,
+                                    "fees": {k: str(v) for k, v in totals.fees.items()}})
         position = await open_position(
             self._venue, run_id=self._run_id, intent_id=intent_id,
-            inst_id=inst_id, filled_qty=qty, avg_entry_px=avg_px,
+            inst_id=inst_id, filled_qty=totals.qty, avg_entry_px=totals.avg_px,
             structural_stop=result.structural_stop, spec=spec,
             est_cost_per_unit=sized.est_cost_per_unit,
-            policy_version=POLICY_VERSION, fees_paid=fees,
+            policy_version=POLICY_VERSION, fees=totals.fees,
         )
         return outcome, position
 
@@ -391,13 +429,38 @@ class Worker:
     async def run(self, decide_interval_s: float = 30.0) -> None:
         assert self._atk and self._run_id
         ingestor = MarketIngestor(self._atk, self._run_id, self._instruments)
-        ingest_task = asyncio.create_task(ingestor.run(stop=self._stop))
-        decide_task = asyncio.create_task(self._decide_loop(decide_interval_s))
+        tasks = [
+            asyncio.create_task(ingestor.run(stop=self._stop)),
+            asyncio.create_task(self._decide_loop(decide_interval_s)),
+            asyncio.create_task(self._protection_loop(self._s.protection_check_s)),
+        ]
         await self._stop.wait()
-        for t in (ingest_task, decide_task):
+        for t in tasks:
             t.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await t
+
+    async def _protection_loop(self, interval: float) -> None:
+        """Keep a live stop behind every open position, for as long as we run.
+
+        This is deliberately independent of the decision loop and of trading
+        mode: protection is not an entry, and an evaluation crash, a stale feed
+        or a closed entry budget must never be the reason a position sits naked.
+        It is also the only thing that notices protection disappearing MID-run
+        -- cancelled by hand, or expired -- which a startup-only check cannot.
+        """
+        if self._s.mode == "observe" or interval <= 0:
+            return
+        while not self._stop.is_set():
+            try:
+                assert self._venue and self._run_id
+                await sweep_protection(self._venue, self._run_id)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("worker.protection_sweep_failed", err=str(exc)[:200])
+                await self._ops("error", "protection_sweep_failed",
+                                detail={"error": str(exc)[:300]})
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._stop.wait(), timeout=interval)
 
     async def _decide_loop(self, interval: float) -> None:
         # Let the first ingest pass populate the flow window before deciding.

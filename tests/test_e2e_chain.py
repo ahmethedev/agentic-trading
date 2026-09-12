@@ -6,7 +6,7 @@ full chain is proven here with a forced candidate against the paper venue.
 
 from __future__ import annotations
 
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 
 import pytest
 import pytest_asyncio
@@ -223,7 +223,17 @@ async def test_partial_entry_opens_position_sized_to_actual_fill(run_id):
         pos = await con.fetchrow(
             "SELECT * FROM positions WHERE position_id=$1", ex["position_id"])
     requested = Decimal(note["sizing"]["quantity"])
-    # Protection and the R basis follow what we own, not what we asked for.
-    assert pos["initial_qty"] < requested
-    assert pos["initial_qty"] == Decimal(ex["qty_filled"])
+    filled = Decimal(ex["qty_filled"])
+    # Protection and the R basis follow what we own, not what we asked for --
+    # and "own" is net of the fee OKX takes out of the base on a buy.
+    assert filled < requested
+    async with pool.ledger().acquire() as con:
+        base_fee = await con.fetchval(
+            """SELECT coalesce(sum(fee),0) FROM fills
+               WHERE client_order_id=$1 AND fee_ccy='BTC'""",
+            ex["client_order_id"])
+    assert base_fee > 0, "the paper venue must charge a buy fee in base, as OKX does"
+    # Net of the base fee, floored to the lot step: a size the venue can express.
+    expected = (filled - base_fee).quantize(SPEC.lot_sz, rounding=ROUND_DOWN)
+    assert pos["initial_qty"] == expected
     assert pos["qty_open"] == pos["initial_qty"]

@@ -142,6 +142,46 @@ Measured, not assumed — all on OKX TR (`tr.okx.com`) on 12 Sep 2026:
 | Closed-candle flag? | Yes. `confirm` is field 9 of `market_get_candles` (`"1"` closed). DB shows exactly 99 closed + 1 forming per series. |
 | Tool surface | 168 tools with `--modules all`. We start with `market,spot,account` only (no swap/futures/option) **and** enforce a 20-tool allowlist in code. |
 
+### Incident: the naked SOL position (12 Sep 2026)
+
+A live entry filled at 09:11 and the protective OCO was rejected. The position
+stayed open with no stop at the venue for two and a half hours, across two
+restarts that both *noticed* and neither *fixed*.
+
+| Layer | What was wrong |
+|---|---|
+| Fee currency | OKX charges the spot fee in the currency you RECEIVE. The buy filled 0.293818 SOL and paid 0.000293818 SOL in fee, so the account held 0.293524182. The OCO was sized to the filled quantity and asked to sell base that was never credited. |
+| Simulator | `PaperVenue` charged the buy fee in quote and let every OCO succeed, so paper could not reproduce it. |
+| Error surfacing | ATK reports failures as `{"error": true, type, code, message}`. Reading `error` as the description logged the rejection as `ALGO_FAILED: true`, hiding the reason. |
+| Reconciliation | Step 6 reported `reconcile_unprotected` and moved on. Detection without repair is not reconciliation. |
+| Watchdog | Protection was only ever checked at startup, so nothing noticed between restarts. |
+
+What changed: quantity is netted of base-denominated fees before anything is
+sized against it; `PaperVenue` charges the fee the way OKX does and refuses an
+OCO it cannot cover; venue errors carry their code and message; reconciliation
+**re-arms** a naked position from its stored ladder; and a `PROTECTION_CHECK_S`
+watchdog re-checks every open position for as long as the worker runs. Base left
+below `minSz` after an exit can never be sold, so it is closed as dust rather
+than holding the concurrency slot forever.
+
+### Why an approved setup produced no entry
+
+`BELOW_MIN_SIZE` was reported for ETH while 30 USDT of equity sat in an open SOL
+position. Two separate causes, now separated in the code:
+
+* **Equity was read as the USDT balance**, not `totalEq`. Once capital was
+  deployed the risk budget collapsed to the leftover cash (0.048 USDT), so the
+  risk-implied quantity was tiny for a reason that had nothing to do with risk.
+  Equity is now the whole account; `availBal` caps what a spot entry can buy.
+* **The venue minimum ended the trade outright.** It may now be taken when its
+  risk still fits inside `RISK_FRACTION_MAX` — reported as `MIN_SIZE_UPLIFT`, and
+  never beyond that ceiling. `MIN_SIZE_UPLIFT=false` restores the old behaviour.
+  The two failures are distinct codes: `BELOW_MIN_SIZE_RISK` (the minimum breaks
+  the ceiling) and `BELOW_MIN_SIZE_BALANCE` (no free quote to buy it).
+
+A sizing rejection now also records the gate's verdict. Previously the decision
+card blamed sizing for a trade the gate had already refused for another reason.
+
 ### Account (verified 12 Sep 2026, authenticated)
 
 | Field | Value |

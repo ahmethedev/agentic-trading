@@ -290,6 +290,29 @@ class AtkClient:
         if payload.get("ok") is False or result.get("isError"):
             # Surface the venue error code so callers can distinguish a permanent
             # rejection (bad size/balance) from a transient one worth retrying.
-            err = payload.get("error") or payload.get("message") or payload
-            raise AtkError(f"{tool}: {json.dumps(err)[:400]}")
+            #
+            # ATK reports failures as {"error": true, type, code, message, ...}.
+            # Reading `error` as the description turned every rejection into the
+            # string "true" -- which is how an OCO refused for insufficient
+            # balance reached the ledger as "ALGO_FAILED: true" and cost hours of
+            # diagnosis. Build the message from the fields that carry meaning.
+            raise AtkError(f"{tool}: {_describe_error(payload)}")
         return payload
+
+
+def _describe_error(payload: dict[str, Any]) -> str:
+    """A human- and grep-readable description of an ATK/OKX failure."""
+    err = payload.get("error")
+    # Older/other shapes put the description in `error` itself; the current ATK
+    # puts a bare `true` there and the meaning in the sibling fields.
+    if isinstance(err, dict):
+        return json.dumps(err)[:400]
+    if isinstance(err, str) and err:
+        return err[:400]
+    parts = [
+        str(payload[k]) for k in ("type", "code", "message", "suggestion")
+        if payload.get(k)
+    ]
+    if parts:
+        return " | ".join(parts)[:400]
+    return json.dumps(payload)[:400]

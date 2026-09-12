@@ -14,7 +14,7 @@ What this resolves, in order:
   3. Fills we missed while down         -> ingested idempotently
   4. Entries that filled without a position row -> position rebuilt and protected
   5. Open positions                     -> checked against real base balance
-  6. Protection for open positions      -> verified still live at the venue
+  6. Protection for open positions      -> verified AND re-placed if missing
   7. Inventory we hold but cannot explain -> surfaced, never silently adopted
 """
 
@@ -27,7 +27,9 @@ from decimal import Decimal
 import structlog
 
 from ..db import pool
+from ..risk.sizing import InstrumentSpec
 from .order_manager import OrderManager
+from .position import open_position, sweep_protection
 from .venue import TERMINAL, OrdStatus, Venue, VenueUnknown
 
 log = structlog.get_logger(__name__)
@@ -46,6 +48,8 @@ class ReconcileReport:
     positions_rebuilt: int = 0
     positions_checked: int = 0
     positions_closed_externally: int = 0
+    protection_repaired: list[int] = field(default_factory=list)
+    positions_closed_as_dust: list[int] = field(default_factory=list)
     unprotected_positions: list[int] = field(default_factory=list)
     unexplained_balances: dict[str, str] = field(default_factory=dict)
     unresolved: list[str] = field(default_factory=list)
@@ -56,7 +60,8 @@ class ReconcileReport:
 
         Unprotected positions do NOT block: an open position without venue-side
         protection needs attention, but refusing to run would also refuse to
-        manage it. Unresolved orders DO block -- their size is unknown.
+        manage it -- and step 6 has already tried to re-arm it. Unresolved orders
+        DO block -- their size is unknown.
         """
         return not self.unresolved
 
@@ -69,6 +74,8 @@ class ReconcileReport:
             "positions_rebuilt": self.positions_rebuilt,
             "positions_checked": self.positions_checked,
             "positions_closed_externally": self.positions_closed_externally,
+            "protection_repaired": self.protection_repaired,
+            "positions_closed_as_dust": self.positions_closed_as_dust,
             "unprotected_positions": self.unprotected_positions,
             "unexplained_balances": self.unexplained_balances,
             "unresolved": self.unresolved,
@@ -88,6 +95,7 @@ class Reconciler:
         await self._resolve_in_flight_orders(report)
         await self._rebuild_missing_positions(report)
         await self._check_positions(report)
+        await self._repair_protection(report)
         await self._check_unexplained_inventory(report)
 
         async with pool.ledger().acquire() as con:
@@ -153,9 +161,7 @@ class Reconciler:
                 continue
 
             await self._om._record_state(cid, state, event="STARTUP_RECONCILE")
-            fee = await self._om._ingest_fills(inst, cid)
-            if fee > 0:
-                report.fills_ingested += 1
+            report.fills_ingested += await self._om._ingest_fills(inst, cid)
             if state.status in TERMINAL:
                 report.resolved_orders += 1
             else:
@@ -204,12 +210,9 @@ class Reconciler:
         if not rows:
             return
 
-        from ..risk.sizing import InstrumentSpec
-        from .position import open_position
-
         for r in rows:
-            qty, avg, fees = await self._om.filled_totals(r["client_order_id"])
-            if qty <= 0:
+            totals = await self._om.filled_totals(r["client_order_id"])
+            if totals.qty <= 0:
                 continue
             async with pool.ledger().acquire() as con:
                 spec_row = await con.fetchrow(
@@ -223,19 +226,21 @@ class Reconciler:
                 Decimal(spec_row["min_sz"]), Decimal(spec_row["tick_sz"]))
             await open_position(
                 self._venue, run_id=self._run_id, intent_id=r["intent_id"],
-                inst_id=r["inst_id"], filled_qty=qty, avg_entry_px=avg,
+                inst_id=r["inst_id"], filled_qty=totals.qty,
+                avg_entry_px=totals.avg_px,
                 structural_stop=Decimal(r["structural_stop"]), spec=spec,
                 est_cost_per_unit=Decimal(r["est_cost_per_unit"]),
-                policy_version=r["policy_version"], fees_paid=fees,
+                policy_version=r["policy_version"], fees=totals.fees,
             )
             report.positions_rebuilt += 1
             await self._ops("warn", "position_rebuilt", r["inst_id"], {
-                "intent_id": r["intent_id"], "qty": str(qty), "avg_px": str(avg),
+                "intent_id": r["intent_id"], "qty": str(totals.qty),
+                "avg_px": str(totals.avg_px),
                 "detail": "entry had filled but no position row existed; rebuilt "
                           "from stored fills and the intent's frozen stop",
             })
             log.warning("reconcile.position_rebuilt", intent_id=r["intent_id"],
-                        qty=str(qty))
+                        qty=str(totals.qty))
 
     # ---------------------------------------------------------- step 5 ------
     async def _check_positions(self, report: ReconcileReport) -> None:
@@ -264,22 +269,33 @@ class Reconciler:
                 # position was closed while we were down (stop or TP filled).
                 await self._close_externally(p["position_id"], p["inst_id"])
                 report.positions_closed_externally += 1
-                continue
 
-            # Protection must still exist, or the position is naked.
-            try:
-                algos = await self._venue.get_algo_orders(p["inst_id"])
-            except VenueUnknown:
-                algos = []
-            if not any(a.get("state") in ("live", "pause", "effective")
-                       for a in algos):
-                report.unprotected_positions.append(p["position_id"])
-                await self._ops("error", "reconcile_unprotected", p["inst_id"], {
-                    "position_id": p["position_id"],
-                    "qty_open": str(expected),
-                    "impact": "open position has no live venue-side protection",
-                })
-                log.error("reconcile.unprotected", position_id=p["position_id"])
+    # ---------------------------------------------------------- step 6 ------
+    async def _repair_protection(self, report: ReconcileReport) -> None:
+        """Re-arm any open position that has no live stop at the venue.
+
+        Reporting alone was not enough: run 587 and run 588 both recorded
+        `reconcile_unprotected` for the same live position and then carried on
+        trading around it. Finding a naked position and leaving it naked is not
+        reconciliation.
+        """
+        sweep = await sweep_protection(self._venue, self._run_id)
+        report.protection_repaired = sweep.repaired
+        report.positions_closed_as_dust = sweep.dust_closed
+        report.unprotected_positions = sweep.unprotected
+        if sweep.repaired:
+            await self._ops("warn", "reconcile_protection_repaired", None, {
+                "positions": sweep.repaired,
+                "detail": "open positions were found without venue-side "
+                          "protection and re-armed from their stored ladder",
+            })
+        for pid in sweep.unprotected:
+            await self._ops("error", "reconcile_unprotected", None, {
+                "position_id": pid,
+                "impact": "open position has no live venue-side protection and "
+                          "re-arming it failed",
+            })
+            log.error("reconcile.unprotected", position_id=pid)
 
     async def _close_externally(self, position_id: int, inst_id: str) -> None:
         async with pool.ledger().acquire() as con:

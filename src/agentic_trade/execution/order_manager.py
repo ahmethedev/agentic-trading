@@ -47,12 +47,48 @@ class ReservationDenied(Exception):
 
 
 @dataclass
+class FillTotals:
+    """What an order actually did, from STORED fills only.
+
+    Fees are kept per currency rather than summed: OKX charges a spot fee in the
+    currency you receive, so a buy pays in BASE and a sell pays in QUOTE. Adding
+    those together produces a number in no currency at all, and -- worse -- hides
+    that a buy's fee has already been taken out of the base we can sell.
+    """
+
+    qty: Decimal
+    avg_px: Decimal
+    fees: dict[str, Decimal]
+
+    def fee_in(self, ccy: str) -> Decimal:
+        return self.fees.get(ccy, Decimal(0))
+
+    def entry_cost_in_quote(self, inst_id: str, px: Decimal) -> Decimal:
+        """Entry fees expressed in the quote currency, for PnL accounting.
+
+        The base-denominated part is valued at the entry price: it is base we
+        paid for and no longer own.
+        """
+        base, quote = inst_id.split("-", 1)
+        return self.fee_in(quote) + self.fee_in(base) * px
+
+    def foreign_fee_ccys(self, inst_id: str) -> list[str]:
+        """Fee currencies that are neither leg of the pair (e.g. OKB discounts).
+
+        Reported rather than guessed at: converting them would need a rate we do
+        not have, and silently dropping them would understate cost.
+        """
+        legs = set(inst_id.split("-", 1))
+        return sorted(c for c, v in self.fees.items() if c not in legs and v > 0)
+
+
+@dataclass
 class EntryOutcome:
     client_order_id: str
     status: OrdStatus
     qty_filled: Decimal
     avg_px: Decimal | None
-    fees: Decimal
+    fees: dict[str, Decimal]
     unknown: bool = False
 
 
@@ -160,14 +196,16 @@ class OrderManager:
             return resolved
         except VenueRejected as exc:
             await self._mark_rejected(cid, intent_id, exc.code, exc.message)
-            return EntryOutcome(cid, OrdStatus.REJECTED, Decimal(0), None, Decimal(0))
+            return EntryOutcome(cid, OrdStatus.REJECTED, Decimal(0), None, {})
 
         await self._record_state(cid, state, event="ACK")
-        fees = await self._ingest_fills(inst_id, cid)
+        await self._ingest_fills(inst_id, cid)
         fresh = await self._venue.get_order(inst_id, cid)
         await self._record_state(cid, fresh, event="POLL")
         await self._sync_intent(intent_id, fresh)
-        return EntryOutcome(cid, fresh.status, fresh.qty_filled, fresh.avg_px, fees)
+        totals = await self.filled_totals(cid)
+        return EntryOutcome(cid, fresh.status, fresh.qty_filled, fresh.avg_px,
+                            totals.fees)
 
     # --------------------------------------------------------- reconcile ----
     async def resolve_unknown(
@@ -187,7 +225,7 @@ class OrderManager:
             await self._ops("error", "order_unresolved", inst_id,
                             {"client_order_id": cid, "error": str(exc)[:300]})
             return EntryOutcome(cid, OrdStatus.UNKNOWN, Decimal(0), None,
-                                Decimal(0), unknown=True)
+                                {}, unknown=True)
 
         if state.status is OrdStatus.UNKNOWN:
             # The venue has no such order: it genuinely never landed.
@@ -200,18 +238,20 @@ class OrderManager:
                     "UPDATE intents SET status='RECONCILED' WHERE intent_id=$1",
                     intent_id)
             log.warning("order.never_placed", cid=cid)
-            return EntryOutcome(cid, OrdStatus.CANCELED, Decimal(0), None, Decimal(0))
+            return EntryOutcome(cid, OrdStatus.CANCELED, Decimal(0), None, {})
 
         await self._record_state(cid, state, event="RECONCILE")
-        fees = await self._ingest_fills(inst_id, cid)
+        await self._ingest_fills(inst_id, cid)
         await self._sync_intent(intent_id, state)
+        totals = await self.filled_totals(cid)
         log.info("order.reconciled", cid=cid, status=str(state.status),
                  filled=str(state.qty_filled))
-        return EntryOutcome(cid, state.status, state.qty_filled, state.avg_px, fees)
+        return EntryOutcome(cid, state.status, state.qty_filled, state.avg_px,
+                            totals.fees)
 
     # ------------------------------------------------------------- fills ----
-    async def _ingest_fills(self, inst_id: str, cid: str) -> Decimal:
-        """Store fills idempotently; return total fee for THIS ingest call.
+    async def _ingest_fills(self, inst_id: str, cid: str) -> int:
+        """Store fills idempotently; return how many were NEW to the ledger.
 
         Deduplication is by the venue fill id, enforced by the primary key, so a
         fill seen from both polling and reconciliation is counted exactly once.
@@ -220,9 +260,9 @@ class OrderManager:
             fills = await self._venue.get_fills(inst_id, cid)
         except VenueUnknown as exc:
             log.warning("order.fills_unavailable", cid=cid, err=str(exc)[:150])
-            return Decimal(0)
+            return 0
 
-        total_fee = Decimal(0)
+        new_fills = 0
         async with pool.ledger().acquire() as con:
             for f in fills:
                 inserted = await con.fetchval(
@@ -237,20 +277,24 @@ class OrderManager:
                     f.liquidity, f.ts, self._run_id,
                 )
                 if inserted is not None:
-                    total_fee += f.fee
-        return total_fee
+                    new_fills += 1
+        return new_fills
 
-    async def filled_totals(self, cid: str) -> tuple[Decimal, Decimal, Decimal]:
-        """(qty, weighted avg px, fees) computed from STORED fills only."""
+    async def filled_totals(self, cid: str) -> FillTotals:
+        """Quantity, weighted average price and per-currency fees, from STORED
+        fills only -- never from a venue reply we have not persisted."""
         async with pool.ledger().acquire() as con:
             row = await con.fetchrow(
                 """SELECT coalesce(sum(qty),0) AS q,
-                          coalesce(sum(px*qty),0) AS notional,
-                          coalesce(sum(fee),0) AS fee
+                          coalesce(sum(px*qty),0) AS notional
                    FROM fills WHERE client_order_id=$1""", cid)
+            fee_rows = await con.fetch(
+                """SELECT fee_ccy, sum(fee) AS fee FROM fills
+                   WHERE client_order_id=$1 GROUP BY fee_ccy""", cid)
         q = Decimal(row["q"])
         avg = (Decimal(row["notional"]) / q) if q > 0 else Decimal(0)
-        return q, avg, Decimal(row["fee"])
+        fees = {r["fee_ccy"]: Decimal(r["fee"]) for r in fee_rows if r["fee_ccy"]}
+        return FillTotals(qty=q, avg_px=avg, fees=fees)
 
     # ------------------------------------------------------------ helpers ---
     async def _record_state(self, cid: str, state: OrderState, *, event: str) -> None:

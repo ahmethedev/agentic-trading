@@ -52,6 +52,11 @@ class SizingInput:
     taker_fee_rate: Decimal        # e.g. 0.001 = 10bps, from the venue
     spec: InstrumentSpec
     risk_fraction_max: Decimal = Decimal("0.02")
+    # When the risk-implied quantity lands below the venue minimum, take the
+    # minimum anyway IF its risk still fits inside risk_fraction_max. Without
+    # this a small account can never trade an instrument at all: every approved
+    # setup dies at BELOW_MIN_SIZE. Set False to restore the strict behaviour.
+    allow_min_size_uplift: bool = True
 
 
 @dataclass(frozen=True)
@@ -63,6 +68,7 @@ class SizingResult:
     price_r_distance: Decimal
     account_r_unit: Decimal
     est_cost_per_unit: Decimal
+    risk_ceiling: Decimal          # equity * risk_fraction_max, the hard bound
     capped_by: list[str]           # why quantity is below the risk-implied size
 
 
@@ -70,6 +76,12 @@ def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
     if step <= 0:
         return value
     return (value / step).to_integral_value(rounding=ROUND_DOWN) * step
+
+
+def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
+    if step <= 0:
+        return value
+    return (value / step).to_integral_value(rounding=ROUND_UP) * step
 
 
 def compute_size(inp: SizingInput) -> SizingResult:
@@ -123,25 +135,58 @@ def compute_size(inp: SizingInput) -> SizingResult:
     if qty <= 0:
         raise RiskRejection("QTY_ROUNDS_TO_ZERO",
                             f"risk-implied {qty_by_risk} below lot {inp.spec.lot_sz}")
+    risk_ceiling = inp.equity_quote * inp.risk_fraction_max
+    # The quantity that risk alone allows, before the balance clamp. Used to tell
+    # the two failure modes apart: "the budget is too small" is a different
+    # problem from "there is not enough quote left to buy the minimum".
+    risk_bound_qty = _floor_to_step(qty_by_risk, inp.spec.lot_sz)
+
     if qty < inp.spec.min_sz:
-        # Reaching the venue minimum would require exceeding the risk budget.
-        raise RiskRejection(
-            "BELOW_MIN_SIZE",
-            f"qty {qty} < min {inp.spec.min_sz}; raising it would exceed the risk budget",
-        )
+        # Below the venue minimum nothing can be sent at all. Two distinct
+        # causes, reported separately because they need different answers:
+        # more capital, or a wider stop / bigger budget.
+        min_qty = _ceil_to_step(inp.spec.min_sz, inp.spec.lot_sz)
+        min_risk = min_qty * (price_r + est_cost_per_unit)
+        min_notional = min_qty * inp.entry_reference * (Decimal(1) + inp.taker_fee_rate)
+
+        if not inp.allow_min_size_uplift:
+            raise RiskRejection(
+                "BELOW_MIN_SIZE",
+                f"qty {qty} < min {inp.spec.min_sz}; uplift disabled")
+        if risk_bound_qty < min_qty and min_risk > risk_ceiling:
+            # Even the hard ceiling cannot pay for one minimum lot. This is the
+            # honest "this instrument is too big for this account" answer.
+            raise RiskRejection(
+                "BELOW_MIN_SIZE_RISK",
+                f"venue minimum {min_qty} risks {min_risk} > ceiling "
+                f"{risk_ceiling} ({inp.risk_fraction_max} of equity)")
+        if min_notional > inp.available_quote:
+            raise RiskRejection(
+                "BELOW_MIN_SIZE_BALANCE",
+                f"venue minimum {min_qty} costs {min_notional} quote incl. fee; "
+                f"only {inp.available_quote} spendable")
+
+        # Take the venue minimum. It costs more than the TARGET budget but still
+        # sits inside the hard ceiling -- the number that actually bounds a loss
+        # -- and it is the only size the venue will accept.
+        qty = min_qty
+        capped.append("MIN_SIZE_UPLIFT")
 
     notional = qty * inp.entry_reference
     risk_at_stop = qty * (price_r + est_cost_per_unit)
 
-    # Invariant: realised risk never exceeds the budget (rounding is downward).
-    if risk_at_stop > risk_budget:
-        raise RiskRejection("RISK_EXCEEDS_BUDGET", f"{risk_at_stop} > {risk_budget}")
+    # Invariant: realised risk never exceeds what was authorised. Normally that
+    # is the budget; a min-size uplift is authorised against the hard ceiling
+    # instead, and never beyond it.
+    limit = risk_ceiling if "MIN_SIZE_UPLIFT" in capped else risk_budget
+    if risk_at_stop > limit:
+        raise RiskRejection("RISK_EXCEEDS_BUDGET", f"{risk_at_stop} > {limit}")
 
     return SizingResult(
         quantity=qty, notional=notional, risk_budget=risk_budget,
         risk_at_stop=risk_at_stop, price_r_distance=price_r,
         account_r_unit=account_r_unit, est_cost_per_unit=est_cost_per_unit,
-        capped_by=capped,
+        risk_ceiling=risk_ceiling, capped_by=capped,
     )
 
 

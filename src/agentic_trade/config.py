@@ -67,6 +67,16 @@ class Settings(BaseSettings):
     # out, and no second one can follow while attention is elsewhere. Exits and
     # venue-side protection are unaffected -- this caps openings, never closings.
     max_entries_per_run: int = Field(default=0, alias="MAX_ENTRIES_PER_RUN")
+    # Take the venue's minimum order size when the risk-implied quantity falls
+    # below it, provided that minimum still risks no more than RISK_FRACTION_MAX
+    # of equity. Off means an approved setup on a small account simply dies at
+    # BELOW_MIN_SIZE and never becomes an entry.
+    min_size_uplift: bool = Field(default=True, alias="MIN_SIZE_UPLIFT")
+    # How often the worker re-checks that every open position still has a live
+    # stop at the venue. Protection can vanish between restarts -- cancelled by
+    # hand, expired, or never accepted -- and a startup-only check would not
+    # notice until the next restart.
+    protection_check_s: float = Field(default=60.0, alias="PROTECTION_CHECK_S")
     # Instruments an entry may be opened on, comma-separated. Empty = all that
     # are ingested. This narrows TRADING only: market data is still collected for
     # every instrument, so restricting the armed set never blinds the dashboard

@@ -71,10 +71,13 @@ async def test_clean_fill_records_order_fill_and_fees(run_id, decision_id):
 
     assert out.status is OrdStatus.FILLED
     assert out.qty_filled == D("0.01")
-    qty, avg, fee = await om.filled_totals(out.client_order_id)
-    assert qty == D("0.01")
-    assert avg == D("100")
-    assert fee > 0
+    totals = await om.filled_totals(out.client_order_id)
+    assert totals.qty == D("0.01")
+    assert totals.avg_px == D("100")
+    # A spot BUY pays its fee in the BASE currency, as OKX does -- so the fee
+    # is base we never received, not quote we spent.
+    assert totals.fee_in("BTC") > 0
+    assert totals.fee_in("USDT") == 0
     assert await _intent_status(intent_id) == "FILLED"
 
 
@@ -86,8 +89,7 @@ async def test_partial_fill_is_a_real_position_not_a_cancellation(run_id, decisi
     out = await om.submit_entry(intent_id, INST, D("0.01"), D("100"))
 
     assert out.qty_filled == D("0.005")
-    qty, _, _ = await om.filled_totals(out.client_order_id)
-    assert qty == D("0.005")
+    assert (await om.filled_totals(out.client_order_id)).qty == D("0.005")
     assert await _intent_status(intent_id) == "PARTIAL"
 
 
@@ -137,8 +139,8 @@ async def test_duplicate_fills_are_counted_once(run_id, decision_id):
     intent_id = await _reserve(om, decision_id)
     out = await om.submit_entry(intent_id, INST, D("0.01"), D("100"))
 
-    qty, _, _ = await om.filled_totals(out.client_order_id)
-    assert qty == D("0.01"), "duplicate fill inflated the position"
+    totals = await om.filled_totals(out.client_order_id)
+    assert totals.qty == D("0.01"), "duplicate fill inflated the position"
     async with pool.ledger().acquire() as con:
         n = await con.fetchval(
             "SELECT count(*) FROM fills WHERE client_order_id=$1", out.client_order_id)
@@ -149,11 +151,11 @@ async def test_repeated_ingest_is_idempotent(run_id, decision_id):
     om = OrderManager(PaperVenue(), run_id)
     intent_id = await _reserve(om, decision_id)
     out = await om.submit_entry(intent_id, INST, D("0.01"), D("100"))
-    before, _, _ = await om.filled_totals(out.client_order_id)
+    before = await om.filled_totals(out.client_order_id)
     # Reconciling again (as a restart would) must change nothing.
     await om.resolve_unknown(out.client_order_id, INST, intent_id)
-    after, _, _ = await om.filled_totals(out.client_order_id)
-    assert before == after
+    after = await om.filled_totals(out.client_order_id)
+    assert (before.qty, before.fees) == (after.qty, after.fees)
 
 
 # --------------------------------------------------------------- rejected ---
