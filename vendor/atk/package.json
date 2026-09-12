@@ -1,0 +1,9 @@
+{
+  "name": "agentic-trade-atk",
+  "private": true,
+  "description": "Pinned OKX Agent Trade Kit (mandatory exchange connector for the hackathon).",
+  "dependencies": {
+    "@okx_ai/okx-trade-mcp": "1.4.6",
+    "@okx_ai/okx-trade-cli": "1.4.6"
+  }
+}
