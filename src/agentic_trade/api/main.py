@@ -77,10 +77,20 @@ async def status() -> dict[str, Any]:
                FROM market_trades WHERE venue=$1 GROUP BY inst_id ORDER BY inst_id""",
             VENUE,
         )
+    # The RUN is the authority on what is actually trading, not this process's
+    # own environment: the API and the worker are separate containers reading
+    # the same env file at their own start times, so restarting one and not the
+    # other silently diverges them. Showing "observe" over a live worker is the
+    # most dangerous label this dashboard can print, so it comes from the run
+    # record, and any divergence is surfaced rather than hidden.
+    config_mode = s.mode
+    mode = run["mode"] if run else config_mode
     return {
-        "mode": s.mode,
-        "site": s.okx_site,
-        "demo": s.okx_demo,
+        "mode": mode,
+        "config_mode": config_mode,
+        "mode_mismatch": bool(run and run["mode"] != config_mode),
+        "site": run["site"] if run else s.okx_site,
+        "demo": run["demo"] if run else s.okx_demo,
         "authenticated": s.has_credentials,
         "missing_credentials": s.missing_credentials(),
         "policy_version": run["policy_version"] if run else None,

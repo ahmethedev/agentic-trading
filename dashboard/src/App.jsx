@@ -51,6 +51,7 @@ function StatusStrip({ status }) {
       <h1>Agentic Trade</h1>
       <span className={`pill ${status.mode === 'live' ? 'bad' : 'warn'}`}>
         {status.mode.toUpperCase()}
+        {status.mode_mismatch && ` (api:${status.config_mode})`}
       </span>
       <span className="pill">{status.site.toUpperCase()}{status.demo ? ' · DEMO' : ''}</span>
       <span className={`pill ${status.authenticated ? 'ok' : 'bad'}`}>
