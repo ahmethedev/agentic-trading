@@ -10,6 +10,7 @@ from agentic_trade.db import pool
 from agentic_trade.execution.position import (
     apply_breakeven,
     claim_tp_stage,
+    ingest_exit_fills,
     open_position,
     record_exit_fill,
     sellable_qty,
@@ -290,3 +291,87 @@ async def test_unsellable_dust_closes_instead_of_holding_the_slot(run_id, decisi
     r = await _row(p.position_id)
     assert r["status"] == "CLOSED"
     assert r["qty_open"] == 0
+
+
+# ---------------------------------------------------------- venue-side exits --
+async def _stop_out(venue, qty: Decimal, px: Decimal) -> None:
+    """Fill the protective sell at the venue, the way a triggered OCO does.
+
+    The important part is that it happens under an order id we never issued, so
+    nothing that polls our own client order ids can see it.
+    """
+    await venue.place_limit_ioc("BTC-USDT", "sell", qty, px, "O3916423678690419712")
+
+
+async def test_triggered_stop_is_booked_as_a_real_sale(run_id, decision_id):
+    """A stop that fills at the venue must reach the ledger as a SELL.
+
+    It did not, on 12 Sep 2026: the OCO on SOL-USDT triggered at 13:48, the
+    sweep ran at 13:49, saw zero base and closed position 250 as dust. The sale
+    left no fill row -- so no marker on the chart and no line in the trade list
+    -- and realised PnL stayed at 0 for a trade that actually lost 0.11 USDT.
+    """
+    venue = PaperVenue(balances={"BTC": DEFAULT_QTY})
+    p = await _open(run_id, decision_id)
+    venue.balances["BTC"] = DEFAULT_QTY
+    await _stop_out(venue, DEFAULT_QTY, D("98"))
+
+    sweep = await sweep_protection(venue, run_id)
+    assert sweep.exited == [p.position_id]
+    assert sweep.dust_closed == [], "a completed sale reported as unsellable dust"
+
+    r = await _row(p.position_id)
+    assert r["status"] == "CLOSED"
+    assert r["qty_open"] == 0
+    # (98 - 100) * 10 - 0.98 exit fee.
+    assert r["realized_pnl"] == D("-20.98")
+
+    async with pool.ledger().acquire() as con:
+        sell = await con.fetchrow(
+            "SELECT * FROM fills WHERE run_id=$1 AND side='sell'", run_id)
+    assert sell is not None, "the sell never reached the chart or the trade list"
+    assert sell["px"] == D("98")
+    assert sell["qty"] == DEFAULT_QTY
+    # The venue's id for a triggered algo leg is not one of ours, and the column
+    # is a foreign key: it must be left null rather than invented.
+    assert sell["client_order_id"] is None
+
+
+async def test_exit_fills_are_never_counted_twice(run_id, decision_id):
+    """The sweep re-runs every minute; the same sale must not re-book each time."""
+    venue = PaperVenue(balances={"BTC": DEFAULT_QTY})
+    p = await _open(run_id, decision_id)
+    venue.balances["BTC"] = DEFAULT_QTY
+    await _stop_out(venue, DEFAULT_QTY, D("98"))
+
+    first = await ingest_exit_fills(
+        venue, run_id=run_id, position_id=p.position_id, intent_id=None,
+        inst_id="BTC-USDT", avg_entry_px=D("100"),
+        opened_at=(await _row(p.position_id))["opened_at"], qty_open=DEFAULT_QTY)
+    assert first.stored == 1 and first.closed
+
+    again = await ingest_exit_fills(
+        venue, run_id=run_id, position_id=p.position_id, intent_id=None,
+        inst_id="BTC-USDT", avg_entry_px=D("100"),
+        opened_at=(await _row(p.position_id))["opened_at"], qty_open=D("0"))
+    assert again.stored == 0
+    assert (await _row(p.position_id))["realized_pnl"] == D("-20.98")
+
+
+async def test_a_sale_we_cannot_see_still_closes_the_position(run_id, decision_id):
+    """No fill to explain an empty balance is still not a reason to keep the slot.
+
+    The dust path stays, for base that genuinely cannot be sold -- it just no
+    longer speaks for sales that did happen.
+    """
+    class NoProtect(PaperVenue):
+        async def place_oco(self, *a, **k):
+            raise VenueRejected("ALGO_FAILED", "venue refused")
+
+    venue = NoProtect(balances={"BTC": DEFAULT_QTY})
+    p = await _open(run_id, decision_id, venue=venue)
+    venue.balances["BTC"] = D("0.000001")      # gone, with no fill behind it
+
+    sweep = await sweep_protection(venue, run_id)
+    assert sweep.dust_closed == [p.position_id]
+    assert sweep.exited == []

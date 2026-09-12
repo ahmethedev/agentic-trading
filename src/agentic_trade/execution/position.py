@@ -36,6 +36,8 @@ from .venue import Venue, VenueRejected, VenueUnknown
 
 log = structlog.get_logger(__name__)
 
+VENUE = "okx-tr"
+
 
 @dataclass
 class OpenedPosition:
@@ -256,6 +258,153 @@ async def _ops(run_id: int, severity: str, kind: str, inst_id: str | None,
             run_id, severity, kind, inst_id, json.dumps(detail))
 
 
+# ------------------------------------------------------------------ exits ----
+@dataclass
+class ExitIngest:
+    """What one exit-fill sweep found for a single position."""
+
+    stored: int = 0                      # sells that were new to the ledger
+    applied_qty: Decimal = Decimal(0)    # inventory those sells retired
+    closed: bool = False
+    error: str | None = None
+
+
+async def ingest_exit_fills(
+    venue: Venue,
+    *,
+    run_id: int,
+    position_id: int,
+    intent_id: int | None,
+    inst_id: str,
+    avg_entry_px: Decimal,
+    opened_at,
+    qty_open: Decimal,
+) -> ExitIngest:
+    """Book the sells that happened at the VENUE but never reached the ledger.
+
+    A protective OCO fills under an order id the venue generates when the algo
+    triggers -- OKX reports the fill with `clOrdId` "O3916423678690419712" and no
+    `algoClOrdId` at all -- so nothing that polls OUR client order ids can ever
+    see it. Entry fills are ingested because we know their id; exits had no path
+    in at all, and the sale was invisible three times over: no marker on the
+    chart, no row in the trade list, and realised PnL frozen at zero while the
+    protection sweep closed the position as "dust" because the base was gone
+    (position 250, SOL-USDT, 12 Sep 2026: a real -0.11 USDT stop-out reported as
+    a flat close).
+
+    Attribution is by instrument and time rather than by order id, because the
+    order id is not ours: a sell on this instrument after the position opened is
+    this position's exit. That holds while only one position per instrument is
+    open at a time, which is what the reservation lock already enforces.
+    """
+    try:
+        fills = await venue.get_fills(inst_id)
+    except VenueUnknown as exc:
+        # Could not ask. Say nothing rather than conclude anything: the caller
+        # must not read "no exit found" out of "the venue did not answer".
+        log.warning("position.exit_fills_unavailable", position_id=position_id,
+                    err=str(exc)[:150])
+        return ExitIngest(error=str(exc)[:300])
+
+    quote_ccy = inst_id.split("-", 1)[1]
+    out = ExitIngest()
+    remaining = qty_open
+    sells = sorted(
+        (f for f in fills if f.side == "sell" and f.ts >= opened_at),
+        key=lambda f: f.ts,
+    )
+    for f in sells:
+        async with pool.ledger().acquire() as con:
+            # The venue's clOrdId for a triggered algo leg is not one of ours,
+            # and fills.client_order_id is a foreign key: store the link only
+            # when it resolves, never a fabricated one.
+            known_cid = await con.fetchval(
+                "SELECT client_order_id FROM orders WHERE client_order_id=$1",
+                f.client_order_id)
+            # The (venue, fill_id) primary key is the idempotency boundary for
+            # the whole operation: a fill already stored was already applied to
+            # the position, so a repeated sweep cannot double-count a sale.
+            stored = await con.fetchval(
+                """INSERT INTO fills (venue, fill_id, client_order_id,
+                       exchange_order_id, inst_id, side, px, qty, fee, fee_ccy,
+                       liquidity, ts, run_id)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                   ON CONFLICT (venue, fill_id) DO NOTHING
+                   RETURNING fill_id""",
+                VENUE, f.fill_id, known_cid, f.exchange_order_id, f.inst_id,
+                f.side, f.px, f.qty, f.fee, f.fee_ccy, f.liquidity, f.ts, run_id,
+            )
+        if stored is None:
+            continue
+        out.stored += 1
+
+        apply_qty = min(f.qty, remaining)
+        if apply_qty <= 0:
+            # Kept for the record -- it is a real trade and belongs on the chart
+            # -- but there is no open inventory left for it to retire, and
+            # applying it would invent realised PnL out of someone else's sale.
+            await _ops(run_id, "warn", "exit_fill_unattributed", inst_id, {
+                "position_id": position_id, "fill_id": f.fill_id,
+                "qty": str(f.qty), "px": str(f.px),
+                "detail": "sell fill stored but not applied: the position had no "
+                          "open quantity left to retire",
+            })
+            continue
+
+        fee = f.fee if f.fee_ccy == quote_ccy else Decimal(0)
+        if f.fee_ccy != quote_ccy and f.fee > 0:
+            await _ops(run_id, "warn", "fee_currency_unpriced", inst_id, {
+                "position_id": position_id, "fill_id": f.fill_id,
+                "fee": str(f.fee), "fee_ccy": f.fee_ccy,
+                "detail": "exit fee is not quote-denominated and cannot be "
+                          "valued without a rate; realised PnL excludes it",
+            })
+        if apply_qty < f.qty and f.qty > 0:
+            fee = fee * apply_qty / f.qty
+
+        await record_exit_fill(position_id, apply_qty, f.px, fee, avg_entry_px)
+        remaining -= apply_qty
+        out.applied_qty += apply_qty
+        log.info("position.exit_recorded", position_id=position_id,
+                 fill_id=f.fill_id, qty=str(apply_qty), px=str(f.px))
+
+    if out.applied_qty <= 0:
+        return out
+
+    async with pool.ledger().acquire() as con:
+        status = await con.fetchval(
+            "SELECT status FROM positions WHERE position_id=$1", position_id)
+    out.closed = status == "CLOSED"
+
+    if out.closed and intent_id is not None:
+        # The OCO that sold this is gone from the venue. Leaving its order row
+        # "live" would have the next reconciliation call a triggered stop
+        # NOT_PLACED -- the one status it certainly was not.
+        async with pool.ledger().acquire() as con:
+            async with con.transaction():
+                cids = await con.fetch(
+                    """UPDATE orders SET status='triggered', terminal_at=now(),
+                           last_reconciled_at=now()
+                       WHERE intent_id=$1 AND purpose='STOP' AND qty_filled=0
+                         AND (terminal_at IS NULL OR status='NOT_PLACED')
+                       RETURNING client_order_id""", intent_id)
+                for row in cids:
+                    await con.execute(
+                        """INSERT INTO order_events (client_order_id, event_type,
+                               payload) VALUES ($1,'EXIT_INGESTED',$2)""",
+                        row["client_order_id"],
+                        json.dumps({"position_id": position_id,
+                                    "qty": str(out.applied_qty)}))
+
+    await _ops(run_id, "warn", "position_exit_ingested", inst_id, {
+        "position_id": position_id, "fills": out.stored,
+        "qty": str(out.applied_qty), "closed": out.closed,
+        "detail": "sells that filled at the venue under an id we did not issue "
+                  "were booked against the position",
+    })
+    return out
+
+
 # --------------------------------------------------------------- watchdog ----
 LIVE_ALGO_STATES = ("live", "pause", "effective")
 
@@ -269,6 +418,7 @@ class ProtectionSweep:
     repaired: list[int] = field(default_factory=list)
     unprotected: list[int] = field(default_factory=list)
     dust_closed: list[int] = field(default_factory=list)
+    exited: list[int] = field(default_factory=list)
 
     def summary(self) -> dict[str, object]:
         return {
@@ -277,6 +427,7 @@ class ProtectionSweep:
             "repaired": self.repaired,
             "unprotected": self.unprotected,
             "dust_closed": self.dust_closed,
+            "exited": self.exited,
         }
 
 
@@ -295,7 +446,7 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
     async with pool.ledger().acquire() as con:
         rows = await con.fetch(
             """SELECT p.position_id, p.intent_id, p.inst_id, p.qty_open,
-                      p.avg_entry_px, p.price_r_distance,
+                      p.avg_entry_px, p.price_r_distance, p.opened_at,
                       coalesce(p.current_stop_px, p.initial_stop_px) AS stop_px,
                       i.lot_sz, i.min_sz, i.tick_sz
                FROM positions p
@@ -307,6 +458,20 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
     for r in rows:
         sweep.checked += 1
         pid, inst = r["position_id"], r["inst_id"]
+
+        # Book any venue-side exit BEFORE judging the position. A stop that has
+        # already filled leaves zero base behind, which looks exactly like dust
+        # -- and closing it as dust buries a real sale under a realised PnL of
+        # zero. This is the difference between "we sold" and "we cannot sell".
+        exited = await ingest_exit_fills(
+            venue, run_id=run_id, position_id=pid, intent_id=r["intent_id"],
+            inst_id=inst, avg_entry_px=Decimal(r["avg_entry_px"]),
+            opened_at=r["opened_at"], qty_open=Decimal(r["qty_open"]))
+        if exited.closed:
+            sweep.exited.append(pid)
+            continue
+        qty_open = Decimal(r["qty_open"]) - exited.applied_qty
+
         if r["lot_sz"] is None:
             sweep.unprotected.append(pid)
             await _ops(run_id, "error", "protection_failed", inst, {
@@ -337,7 +502,7 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
         tp_px = Decimal(r["avg_entry_px"]) + Decimal(r["price_r_distance"]) * TP2_R
         outcome = await ensure_protection(
             venue, run_id=run_id, position_id=pid, intent_id=r["intent_id"],
-            inst_id=inst, qty=Decimal(r["qty_open"]), tp_trigger=tp_px,
+            inst_id=inst, qty=qty_open, tp_trigger=tp_px,
             sl_trigger=stop_px, spec=spec)
 
         if outcome.ok:
@@ -356,7 +521,7 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
         else:
             sweep.unprotected.append(pid)
 
-    if sweep.repaired or sweep.unprotected or sweep.dust_closed:
+    if sweep.repaired or sweep.unprotected or sweep.dust_closed or sweep.exited:
         log.warning("protection.sweep", **sweep.summary())
     return sweep
 

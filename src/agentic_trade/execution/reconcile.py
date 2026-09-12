@@ -13,9 +13,10 @@ What this resolves, in order:
   2. Orders in flight / UNKNOWN         -> queried by client order id
   3. Fills we missed while down         -> ingested idempotently
   4. Entries that filled without a position row -> position rebuilt and protected
-  5. Open positions                     -> checked against real base balance
-  6. Protection for open positions      -> verified AND re-placed if missing
-  7. Inventory we hold but cannot explain -> surfaced, never silently adopted
+  5. Exits that filled while we were down -> ingested and booked against the position
+  6. Open positions                     -> checked against real base balance
+  7. Protection for open positions      -> verified AND re-placed if missing
+  8. Inventory we hold but cannot explain -> surfaced, never silently adopted
 """
 
 from __future__ import annotations
@@ -29,7 +30,12 @@ import structlog
 from ..db import pool
 from ..risk.sizing import InstrumentSpec
 from .order_manager import OrderManager
-from .position import LIVE_ALGO_STATES, open_position, sweep_protection
+from .position import (
+    LIVE_ALGO_STATES,
+    ingest_exit_fills,
+    open_position,
+    sweep_protection,
+)
 from .venue import TERMINAL, OrdStatus, Venue, VenueUnknown
 
 log = structlog.get_logger(__name__)
@@ -45,6 +51,8 @@ class ReconcileReport:
     resolved_orders: int = 0
     adopted_orders: int = 0
     fills_ingested: int = 0
+    exit_fills_ingested: int = 0
+    positions_closed_by_exit: int = 0
     positions_rebuilt: int = 0
     positions_checked: int = 0
     positions_closed_externally: int = 0
@@ -60,7 +68,7 @@ class ReconcileReport:
 
         Unprotected positions do NOT block: an open position without venue-side
         protection needs attention, but refusing to run would also refuse to
-        manage it -- and step 6 has already tried to re-arm it. Unresolved orders
+        manage it -- and step 7 has already tried to re-arm it. Unresolved orders
         DO block -- their size is unknown.
         """
         return not self.unresolved
@@ -71,6 +79,8 @@ class ReconcileReport:
             "resolved_orders": self.resolved_orders,
             "adopted_orders": self.adopted_orders,
             "fills_ingested": self.fills_ingested,
+            "exit_fills_ingested": self.exit_fills_ingested,
+            "positions_closed_by_exit": self.positions_closed_by_exit,
             "positions_rebuilt": self.positions_rebuilt,
             "positions_checked": self.positions_checked,
             "positions_closed_externally": self.positions_closed_externally,
@@ -94,6 +104,7 @@ class Reconciler:
         await self._release_unsent_intents(report)
         await self._resolve_in_flight_orders(report)
         await self._rebuild_missing_positions(report)
+        await self._ingest_exits(report)
         await self._check_positions(report)
         await self._repair_protection(report)
         await self._check_unexplained_inventory(report)
@@ -299,6 +310,36 @@ class Reconciler:
                         qty=str(totals.qty))
 
     # ---------------------------------------------------------- step 5 ------
+    async def _ingest_exits(self, report: ReconcileReport) -> None:
+        """Book exits that filled at the venue while we were down.
+
+        This runs BEFORE the balance check on purpose. A stop that triggered
+        overnight leaves a position whose base balance is zero, and the balance
+        check alone can only say "it is gone" -- it closes the position with no
+        price, no fee and no realised PnL. The sale itself is sitting in the
+        venue's fill history the whole time; it just never had a path into the
+        ledger, because the triggered algo leg carries an order id we did not
+        issue.
+        """
+        async with pool.ledger().acquire() as con:
+            rows = await con.fetch(
+                """SELECT position_id, intent_id, inst_id, qty_open,
+                          avg_entry_px, opened_at
+                   FROM positions WHERE status <> 'CLOSED' AND qty_open > 0"""
+            )
+        for p in rows:
+            out = await ingest_exit_fills(
+                self._venue, run_id=self._run_id, position_id=p["position_id"],
+                intent_id=p["intent_id"], inst_id=p["inst_id"],
+                avg_entry_px=Decimal(p["avg_entry_px"]),
+                opened_at=p["opened_at"], qty_open=Decimal(p["qty_open"]))
+            report.exit_fills_ingested += out.stored
+            if out.closed:
+                report.positions_closed_by_exit += 1
+                log.warning("reconcile.closed_by_exit",
+                            position_id=p["position_id"], qty=str(out.applied_qty))
+
+    # ---------------------------------------------------------- step 6 ------
     async def _check_positions(self, report: ReconcileReport) -> None:
         async with pool.ledger().acquire() as con:
             positions = await con.fetch(
@@ -321,12 +362,15 @@ class Reconciler:
             expected = Decimal(p["qty_open"])
 
             if held <= 0 < expected:
-                # We think we hold inventory; the venue says we hold none. The
-                # position was closed while we were down (stop or TP filled).
+                # We think we hold inventory, the venue says we hold none, and
+                # step 5 found no fill that explains where it went. Something
+                # sold this base outside the system -- by hand, or before the
+                # venue's fill history window. Close it, but say plainly that
+                # the realised PnL is missing a leg.
                 await self._close_externally(p["position_id"], p["inst_id"])
                 report.positions_closed_externally += 1
 
-    # ---------------------------------------------------------- step 6 ------
+    # ---------------------------------------------------------- step 7 ------
     async def _repair_protection(self, report: ReconcileReport) -> None:
         """Re-arm any open position that has no live stop at the venue.
 
@@ -359,14 +403,16 @@ class Reconciler:
                 """UPDATE positions SET status='CLOSED', closed_at=now(),
                        qty_open=0
                    WHERE position_id=$1""", position_id)
-        await self._ops("warn", "position_closed_externally", inst_id, {
+        await self._ops("error", "position_closed_externally", inst_id, {
             "position_id": position_id,
-            "detail": "venue reports no base balance; position closed while down. "
-                      "Realised PnL is reconstructed from ingested fills.",
+            "detail": "venue reports no base balance and no sell fill explains it; "
+                      "the position is closed to free the slot.",
+            "impact": "realised PnL for this position has no exit leg and is "
+                      "understated; the sale happened outside this system",
         })
         log.warning("reconcile.closed_externally", position_id=position_id)
 
-    # ---------------------------------------------------------- step 7 ------
+    # ---------------------------------------------------------- step 8 ------
     async def _check_unexplained_inventory(self, report: ReconcileReport) -> None:
         """Base currency we hold that no open position accounts for.
 
