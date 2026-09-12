@@ -79,10 +79,16 @@ class Worker:
                    VALUES ($1,$2,$3,$4,$5,$6) RETURNING run_id""",
                 s.mode, s.okx_site, s.okx_demo, POLICY_VERSION, "0.1.0",
                 json.dumps({"instruments": self._instruments,
-                            "authenticated": s.has_credentials}),
+                            "authenticated": s.has_credentials,
+                            "max_entries_per_run": s.max_entries_per_run,
+                            "entry_instruments":
+                                sorted(s.armed_instruments)
+                                if s.armed_instruments else None}),
             )
         log.info("worker.run_started", run_id=self._run_id, mode=s.mode,
-                 authenticated=s.has_credentials, instruments=self._instruments)
+                 authenticated=s.has_credentials, instruments=self._instruments,
+                 entry_budget=s.max_entries_per_run or "unlimited",
+                 armed=sorted(s.armed_instruments) if s.armed_instruments else "all")
 
         await self._load_instrument_specs()
         await self._load_account_context()
@@ -223,7 +229,9 @@ class Worker:
             equity_is_real=self._equity_is_real, run_id=self._run_id,
             reconciled=self._reconciled,
             limits=gate.GateLimits(
-                max_concurrent_positions=self._s.max_concurrent_positions),
+                max_concurrent_positions=self._s.max_concurrent_positions,
+                max_entries_per_run=self._s.max_entries_per_run,
+                armed_instruments=self._s.armed_instruments),
         )
         note["gate"] = gate_result.detail
 
@@ -301,6 +309,7 @@ class Worker:
             qty=sized.quantity, est_cost_per_unit=sized.est_cost_per_unit,
             policy_version=POLICY_VERSION,
             max_concurrent=self._s.max_concurrent_positions,
+            max_entries_per_run=self._s.max_entries_per_run,
         )
 
         outcome = await self._om.submit_entry(

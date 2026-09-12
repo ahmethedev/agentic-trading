@@ -24,6 +24,13 @@ class GateResult:
 @dataclass
 class GateLimits:
     max_concurrent_positions: int = 1
+    # Entries this run may open in total. 0 = unlimited. Set to 1 to arm exactly
+    # one supervised entry: once it is reserved, the gate stops authorising new
+    # ones. This caps OPENINGS only -- exits and protection are never gated.
+    max_entries_per_run: int = 0
+    # Instruments entries are allowed on. None = no restriction. Narrowing this
+    # gates OPENINGS only; data collection and exits are untouched.
+    armed_instruments: frozenset[str] | None = None
     # Daily realised-loss budget as a fraction of the session's opening equity.
     daily_loss_fraction: Decimal = Decimal("0.03")
     max_data_age_s: float = 45.0
@@ -72,6 +79,11 @@ async def evaluate(
         # one exists (AGENT.md §5).
         unknown = await con.fetchval(
             "SELECT count(*) FROM intents WHERE status = 'UNKNOWN'")
+        # Entries this run has already claimed, whatever became of them. A
+        # rejected or unfilled attempt still spends the budget: the point is to
+        # cap how many real orders leave the process, not how many worked.
+        entries_this_run = await con.fetchval(
+            "SELECT count(*) FROM intents WHERE run_id=$1 AND side='buy'", run_id)
         realised_today = await con.fetchval(
             """SELECT coalesce(sum(realized_pnl),0) FROM positions
                WHERE run_id=$1 AND closed_at::date = $2::date""",
@@ -88,6 +100,16 @@ async def evaluate(
         codes.append("UNRESOLVED_ORDER")
     if open_positions + pending >= limits.max_concurrent_positions:
         codes.append("CONCURRENCY_LIMIT")
+
+    if limits.armed_instruments is not None and inst_id not in limits.armed_instruments:
+        detail["armed_instruments"] = sorted(limits.armed_instruments)
+        codes.append("INSTRUMENT_NOT_ARMED")
+
+    detail["entries_this_run"] = entries_this_run
+    if limits.max_entries_per_run:
+        detail["entry_budget"] = limits.max_entries_per_run
+        if entries_this_run >= limits.max_entries_per_run:
+            codes.append("ENTRY_BUDGET_EXHAUSTED")
 
     # Realised PnL is net of fees; both count against the daily budget.
     day_pnl = Decimal(realised_today) - Decimal(fees_today)

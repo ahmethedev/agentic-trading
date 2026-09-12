@@ -70,6 +70,7 @@ class OrderManager:
         entry_reference: Decimal, structural_stop: Decimal,
         price_r_distance: Decimal, qty: Decimal, est_cost_per_unit: Decimal,
         policy_version: str, max_concurrent: int = 1,
+        max_entries_per_run: int = 0,
     ) -> int:
         """Persist an intent and claim the position slot, atomically.
 
@@ -96,6 +97,22 @@ class OrderManager:
                         "CONCURRENCY_LIMIT",
                         f"{open_positions} open + {pending} pending >= {max_concurrent}",
                     )
+
+                # The gate checks this too, but only this check is inside the
+                # lock. Under the same advisory lock as the insert, an arming
+                # budget of 1 means exactly one entry can ever be reserved --
+                # the gate's read could otherwise go stale between check and
+                # insert and let a second order out.
+                if max_entries_per_run:
+                    entries = await con.fetchval(
+                        "SELECT count(*) FROM intents WHERE run_id=$1 AND side='buy'",
+                        self._run_id,
+                    )
+                    if entries >= max_entries_per_run:
+                        raise ReservationDenied(
+                            "ENTRY_BUDGET_EXHAUSTED",
+                            f"{entries} entries this run >= {max_entries_per_run}",
+                        )
 
                 intent_id = await con.fetchval(
                     """INSERT INTO intents (decision_id, run_id, inst_id, side, status,

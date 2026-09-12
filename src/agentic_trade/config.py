@@ -43,6 +43,16 @@ class Settings(BaseSettings):
     risk_fraction: Decimal = Field(default=Decimal("0.01"), alias="RISK_FRACTION")
     risk_fraction_max: Decimal = Field(default=Decimal("0.02"), alias="RISK_FRACTION_MAX")
     max_concurrent_positions: int = Field(default=1, alias="MAX_CONCURRENT_POSITIONS")
+    # Entries this run may OPEN before the gate stops authorising new ones.
+    # 0 = unlimited. Set to 1 for a supervised first live entry: the order goes
+    # out, and no second one can follow while attention is elsewhere. Exits and
+    # venue-side protection are unaffected -- this caps openings, never closings.
+    max_entries_per_run: int = Field(default=0, alias="MAX_ENTRIES_PER_RUN")
+    # Instruments an entry may be opened on, comma-separated. Empty = all that
+    # are ingested. This narrows TRADING only: market data is still collected for
+    # every instrument, so restricting the armed set never blinds the dashboard
+    # or interrupts the observe-mode record.
+    entry_instruments: str = Field(default="", alias="ENTRY_INSTRUMENTS")
 
     @field_validator("mode")
     @classmethod
@@ -51,6 +61,12 @@ class Settings(BaseSettings):
         if v not in allowed:
             raise ValueError(f"MODE must be one of {sorted(allowed)}, got {v!r}")
         return v
+
+    @property
+    def armed_instruments(self) -> frozenset[str] | None:
+        """Instruments entries are allowed on, or None for no restriction."""
+        names = {p.strip() for p in self.entry_instruments.split(",") if p.strip()}
+        return frozenset(names) or None
 
     @property
     def has_credentials(self) -> bool:

@@ -9,8 +9,9 @@ Design source: [AGENT.md](AGENT.md). Active policy profile: `retail_baseline_v1`
 > Status: **Deployed to the VPS in `observe` mode, collecting data.** Gate 1 (see)
 > and Gate 2 (control) built. The full chain
 > decision → intent → reservation → order → fill → position → protection runs and is
-> tested against a fault-injecting paper venue. Live trading is blocked only by
-> funding: **the competition sub-account holds no balance yet.**
+> tested against a fault-injecting paper venue. The sub-account is **funded (30 USDT,
+> verified 12 Sep)**, so nothing but `MODE` now separates this from live trading —
+> and `MODE=live` has still never been exercised. See *Supervised first entry*.
 
 ## Architecture
 
@@ -47,6 +48,8 @@ OKX_API_SECRET=...
 OKX_API_PASSPHRASE=...        # REQUIRED -- see Known gaps
 DATABASE_URL=postgresql://agentic:...@127.0.0.1:5433/agentic_trade
 MODE=observe                  # observe | paper | live
+MAX_ENTRIES_PER_RUN=0         # 0 = unlimited; 1 arms a single supervised entry
+ENTRY_INSTRUMENTS=            # empty = all; e.g. BTC-USDT restricts entries only
 ```
 
 ## Run
@@ -65,6 +68,18 @@ DATABASE_URL=... .venv/bin/python -m pytest tests/ -q        # 62 tests
 `MODE` controls the order path: `observe` never sends an order, `paper` runs the
 identical state machine against a simulated venue, `live` sends real orders. The
 tests cover `observe` and `paper`; `live` has never been exercised.
+
+`MAX_ENTRIES_PER_RUN` caps how many entries one run may **open** — `0` is unlimited,
+`1` arms exactly one. It is checked in the risk gate (so the funnel shows
+`ENTRY_BUDGET_EXHAUSTED` rather than going silently quiet) and again inside the
+reservation transaction, which is the only check that cannot go stale between
+reading and inserting. It caps openings only: exits and venue-side protection are
+never gated by it.
+
+`ENTRY_INSTRUMENTS` restricts which instruments an entry may be opened on
+(`INSTRUMENT_NOT_ARMED` when it blocks one). It narrows **trading only** — market
+data is still ingested for every instrument, so arming a single pair never blinds
+the dashboard or puts a hole in the observe-mode record.
 
 ## Deploy
 
@@ -205,21 +220,81 @@ position insert leaves real inventory with no stop and no exit ladder. Nothing i
 invented in rebuilding it — the quantity and average price come from actual stored
 fills, and the structural stop and policy version from the durable intent row.
 
+## Supervised first entry
+
+`MODE=live` has never run. The first real order should be watched, not discovered
+unattended, so the run is *armed* for exactly one entry:
+
+```
+MODE=live
+MAX_ENTRIES_PER_RUN=1
+ENTRY_INSTRUMENTS=BTC-USDT
+```
+
+The worker then sends at most one entry, on one pair, for the life of that run. After it is
+reserved, every further candidate is refused with `ENTRY_BUDGET_EXHAUSTED` and the
+reason appears in the decision funnel. Restarting the worker starts a new run and
+re-arms the budget — arming is per run, deliberately, so a restart is an explicit
+decision to allow another entry.
+
+Watch it with:
+
+```bash
+./scripts/watch_entry.sh      # intent -> order -> fill -> position -> protection
+ssh <vps> 'docker logs -f agentic-trade-worker'
+```
+
+### What a live entry actually does
+
+Worth being precise, because it is *not* the full ladder the policy describes:
+
+1. A confirmed setup is sized against the **worst** price it is willing to pay
+   (the +0.1% marketable-limit cap), so a fill at the limit still lands inside the
+   risk budget.
+2. A durable intent + reservation is written, then a **limit IOC buy** is sent.
+   Anything unfilled is cancelled by the venue — this never rests in the book.
+3. The position is recorded from **actual fills**, and an **OCO covering the whole
+   position** is attached: take-profit at +2.5R, stop at the structural stop (−1R).
+
+So the live outcome is binary — roughly −1R or +2.5R on the full position.
+
+**The staged exit ladder does not run.** `apply_breakeven`, `claim_tp_stage` and
+`record_exit_fill` are exercised by tests and `scripts/paper_demo.py`, but no loop in
+the worker calls them. Live, there is no breakeven move at +1R, no 30% partial at
++2R, and no runner. Two consequences follow, and neither is dangerous while someone
+is watching:
+
+* When the OCO fires at the venue, **the ledger does not learn about it.** The
+  position stays `OPEN` with `realized_pnl = 0` until the worker is restarted, at
+  which point startup reconciliation sees no base balance and closes it out.
+* Because the gate counts non-`CLOSED` positions against `MAX_CONCURRENT_POSITIONS`,
+  that stale row blocks further entries on its own. Convenient, but it is a
+  consequence of a missing loop rather than a control — which is exactly why
+  `MAX_ENTRIES_PER_RUN` exists as the explicit one.
+
+Closing the trade out is therefore a manual step: once the OCO has fired, restart the
+worker and confirm `positions` shows `CLOSED` and the fills are ingested.
+
 ## Known gaps
 
-1. **The account is unfunded (`totalEq = 0`).** Authentication works and the real fee
-   tier is read from the venue, but no entry can be sized until the competition credit
-   is allocated or funds are transferred in. The worker logs `account_unfunded` and the
-   risk engine rejects with `NO_EQUITY` rather than sizing against a placeholder.
-   Transferring funds is a manual step — `account_transfer` is deliberately not in the
-   tool allowlist.
-2. **No order path.** `observe` mode records `BUY_INTENT` conditions but never sends an
-   order. Intent → reservation → order → fill → reconcile (Gate 2) is not built.
+1. ~~The account is unfunded.~~ **Resolved 12 Sep**: the sub-account holds 30 USDT and
+   the worker reads it as real equity (`worker.account_loaded equity=30 taker_fee=0.001`).
+   Transferring funds remains a manual step — `account_transfer` is deliberately not in
+   the tool allowlist.
+2. **No exit management loop.** The order path (intent → reservation → order → fill →
+   reconcile) is built and tested, but nothing drives the staged exit ladder or records
+   an exit fill while the worker is running. Protection is the venue-side OCO alone, and
+   a closed position is only noticed at the next restart. See *Supervised first entry*.
 3. **Unverified competition rules**: sub-account, starting credit, permitted pairs, real
    fee tier, and the 19:30 open-position rule still need confirming from the organiser.
 4. **Polling, not streaming.** Order flow is reconstructed from polled prints and is not
    a tick feed. During book sweeps prints are provably lost (see *Burst limitation*);
    the flow feature then reports invalid rather than guessing.
 5. **`MODE=live` has still never been exercised.** Every test covers `observe` and
-   `paper`. The first live order will be the first live order.
+   `paper`. The first live order will be the first live order — hence
+   `MAX_ENTRIES_PER_RUN=1` and a supervised run. The ATK request/response shapes the
+   live adapter depends on were read out of the pinned 1.4.6 bundle rather than assumed:
+   a per-order `sCode != "0"` becomes an `isError` reply, which the client raises as
+   `AtkError` and the venue maps to `VenueRejected`, so a venue refusal is a clean
+   rejection rather than a phantom LIVE order.
 6. `AGENTIC_TRADING_HACKATHON_PLAYBOOK.md`, referenced by AGENT.md, does not exist.
