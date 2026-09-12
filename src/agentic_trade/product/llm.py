@@ -21,6 +21,7 @@ records, not from the model's own account of itself.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -76,12 +77,20 @@ Bu durumda piyasa ve strateji sorularını cevapla, diğerleri için operatör \
 erişim kodunun gerektiğini söyle.
 
 BİÇİM
-- Türkçe, sade ve kısa yaz: en fazla 6 cümle. Önce sonuç, sonra dayanak, \
-gerekiyorsa tek bir sonraki adım.
-- Sayıları Türkçe biçimde ver (ondalık ayırıcı virgül) ve birimini yaz \
-(USDT, %, R, bps). Belirsiz değeri "—" ile göster, sıfır yazma.
-- Markdown tablo, başlık ve emoji kullanma. Madde işareti gerekiyorsa en fazla \
-üç kısa madde.
+- Arayüz cevabı DÜZ METİN olarak gösterir; markdown işlenmez. Yıldız, **kalın**, \
+başlık, tablo, kod bloğu ve emoji kullanma - ekranda ham karakter olarak görünür.
+- Türkçe, sade ve kısa yaz: en fazla 5 cümle, tek paragraf. Parite başına \
+ayrı bölüm açma; birden çok parite varsa hepsini tek cümlede özetle ve yalnız \
+soruyla ilgili olanı ayrıntılandır.
+- Önce sonuç, sonra dayanak, gerekiyorsa tek bir sonraki adım.
+- Sayıları Türkçe biçimde ver (ondalık ayırıcı virgül) ve birimini yaz: fiyatlar \
+USDT'dir, dolar işareti kullanma. Diğer birimler %, R, bps. Belirsiz değeri \
+"—" ile göster, sıfır yazma.
+- Araç sonucunda olmayan bir tanımı (ortalama periyodu, zaman penceresi, eşik) \
+uydurma. Yalnız verilen alan adlarına ve değerlere dayan.
+- Ham alan adlarını cevaba yazma (book_stale, rvol, flow_imbalance gibi); \
+Türkçe karşılığını kullan: "emir defteri verisi eski", "göreli hacim", \
+"alıcı/satıcı dengesi".
 - Kullandığın araçların adını cevap metninde sayma; arayüz zaten gösteriyor."""
 
 
@@ -172,8 +181,34 @@ def available(settings: Settings) -> bool:
     return True
 
 
+_EMPHASIS = re.compile(r"\*\*(.+?)\*\*|__(.+?)__", re.S)
+_HEADING = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+
+
+def plain(text: str) -> str:
+    """Strip markdown the chat panel cannot render.
+
+    The panel prints the answer as text, so a stray ** reaches the user as two
+    asterisks. The system prompt asks for plain text and the model mostly obeys,
+    but "mostly" is not a rendering guarantee -- this makes it one.
+    """
+    text = _EMPHASIS.sub(lambda m: m.group(1) or m.group(2), text)
+    text = _HEADING.sub("", text)
+    return text.replace("`", "")
+
+
+def plain_delta(delta: str) -> str:
+    """Same idea for a streamed fragment, where a pair may be split in two.
+
+    Emphasis markers carry no meaning here, so dropping the characters as they
+    arrive is safe and needs no buffering; the final text is cleaned again.
+    """
+    return delta.replace("*", "").replace("`", "").replace("#", "")
+
+
 def _text_of(content: list[Any]) -> str:
-    return "\n".join(b.text for b in content if getattr(b, "type", None) == "text").strip()
+    joined = "\n".join(b.text for b in content if getattr(b, "type", None) == "text")
+    return plain(joined).strip()
 
 
 # Models that accept output_config.effort. Haiku 4.5 -- the cheap default here --
@@ -244,7 +279,7 @@ async def run(
             ) as stream:
                 async for event in stream:
                     if event.type == "text":
-                        yield {"type": "text", "delta": event.text}
+                        yield {"type": "text", "delta": plain_delta(event.text)}
                 response = await stream.get_final_message()
         except APIError as exc:
             raise LLMUnavailable(f"Model çağrısı başarısız: {type(exc).__name__}") from exc

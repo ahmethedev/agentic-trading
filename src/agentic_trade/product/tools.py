@@ -117,7 +117,11 @@ async def get_market_overview(ctx: Context, inst_id: str | None = None) -> dict:
             for r in rows
         ],
         "note": "regime_label ölçüm değil, above_ma ve trend_slope_atr üzerinden türetilmiş "
-        "kaba bir etikettir. Zayıf trend otomatik olarak range demek değildir.",
+        "kaba bir etikettir. Zayıf trend otomatik olarak range demek değildir. "
+        "Alan tanımları: above_ma = 15m bağlamda 20 mumluk ortalamanın üstünde mi; "
+        "trend_slope_atr = ATR'ye göre normalize edilmiş eğim; rvol = göreli hacim "
+        "(1,0 = normal); flow_imbalance/flow_trades = 60 saniyelik akış penceresi; "
+        "fiyatlar USDT. Burada yazmayan bir periyot veya eşik uydurma.",
     }
 
 

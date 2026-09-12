@@ -35,6 +35,7 @@ REASONS = {
     "DAILY_LOSS_LIMIT": "Günlük zarar limiti",
     "RECONCILE_INCOMPLETE": "Emir ve hesap mutabakatı tamamlanmadı",
     "OBSERVE_MODE_NO_ORDERS": "Gözlem modu emir göndermez",
+    "BELOW_MIN_SIZE": "Risk bütçesine sığan miktar borsanın minimum işlem boyutunun altında",
     "NO_EQUITY": "Kullanılabilir sermaye yok",
     "EQUITY_NOT_VERIFIED": "Sermaye doğrulanmadı",
     "ENTRY_FILLED": "Giriş emri gerçekleşti",

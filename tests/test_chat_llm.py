@@ -401,3 +401,34 @@ async def test_account_questions_still_require_operator_session(monkeypatch, mes
         for path in ("/api/product/ask", "/api/product/ask/stream"):
             response = await c.post(path, json={"message": message}, headers=ORIGIN)
             assert response.status_code == 401
+
+
+# --- Output the chat panel can actually render -------------------------------
+
+
+def test_markdown_is_stripped_because_the_panel_prints_text():
+    assert llm.plain("**BTC** güçlü") == "BTC güçlü"
+    assert llm.plain("__ETH__ zayıf") == "ETH zayıf"
+    assert llm.plain("## Başlık\ngövde") == "Başlık\ngövde"
+    assert llm.plain("`rvol` 1,3") == "rvol 1,3"
+    # Ordinary text, including lone asterisks in prose, survives unchanged.
+    assert llm.plain("risk %1 · stop 101,76 USDT") == "risk %1 · stop 101,76 USDT"
+
+
+def test_streamed_fragments_lose_markers_even_when_split():
+    assert llm.plain_delta("**BTC") + llm.plain_delta("USDT**") == "BTCUSDT"
+
+
+async def test_answer_text_is_plain(monkeypatch):
+    monkeypatch.setattr(tools, "strategy", lambda: {"version": "v"})
+    install(
+        monkeypatch,
+        [
+            Response(
+                content=[Block(type="text", text="**Sonuç:** hacim 1,3 · `rvol` düşük")],
+                stop_reason="end_turn",
+            )
+        ],
+    )
+    events = await collect("Piyasa nasıl?", authorized=False)
+    assert events[-1]["result"].text == "Sonuç: hacim 1,3 · rvol düşük"
