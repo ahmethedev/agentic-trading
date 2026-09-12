@@ -230,6 +230,33 @@ async def test_unprotected_position_is_repaired_by_the_sweep(run_id, decision_id
     assert again.already_protected == [p.position_id]
 
 
+async def test_sweep_matches_protection_to_each_position(run_id, decision_id):
+    """One live BTC OCO must not disguise a second naked BTC position."""
+    class SecondProtectionFails(PaperVenue):
+        calls = 0
+        fail_second = True
+
+        async def place_oco(self, *args, **kwargs):
+            self.calls += 1
+            if self.calls == 2 and self.fail_second:
+                raise VenueRejected("ALGO_FAILED", "paper: second OCO rejected")
+            return await PaperVenue.place_oco(self, *args, **kwargs)
+
+    venue = SecondProtectionFails(balances={"BTC": DEFAULT_QTY * 2})
+    first = await _open(run_id, decision_id, venue=venue)
+    second = await _open(run_id, decision_id, venue=venue)
+    assert first.algo_id is not None
+    assert second.algo_id is None
+    assert len(await venue.get_algo_orders("BTC-USDT")) == 1
+
+    venue.fail_second = False
+    sweep = await sweep_protection(venue, run_id)
+
+    assert sweep.already_protected == [first.position_id]
+    assert sweep.repaired == [second.position_id]
+    assert len(await venue.get_algo_orders("BTC-USDT")) == 2
+
+
 async def test_sweep_protects_at_the_breakeven_stop_not_the_original(run_id, decision_id):
     """A repaired stop must be where the position stands now, not where it began."""
     class NoProtect(PaperVenue):

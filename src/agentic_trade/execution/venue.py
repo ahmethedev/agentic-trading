@@ -85,7 +85,10 @@ class Venue(Protocol):
     async def cancel_order(self, inst_id: str, client_order_id: str) -> None: ...
 
     async def get_fills(
-        self, inst_id: str, client_order_id: str | None = None
+        self,
+        inst_id: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
     ) -> list[Fill]: ...
 
     async def place_oco(
@@ -171,9 +174,18 @@ class AtkVenue:
             raise VenueRejected("CANCEL_FAILED", str(exc)) from exc
 
     async def get_fills(
-        self, inst_id: str, client_order_id: str | None = None
+        self,
+        inst_id: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
     ) -> list[Fill]:
         args: dict = {"instId": inst_id, "limit": 100}
+        # The unfiltered endpoint is only the most recent 100 fills.  Once we
+        # know the venue order id, ask for that order directly so a restart can
+        # still repair an older ledger gap and cannot lose the row behind newer
+        # activity on the same instrument.
+        if exchange_order_id:
+            args["ordId"] = exchange_order_id
         try:
             payload = await self._atk.call("spot_get_fills", args)
         except AtkTimeout as exc:
@@ -218,7 +230,18 @@ class AtkVenue:
             raise VenueUnknown(f"place_oco timed out: {exc}") from exc
         except AtkError as exc:
             raise VenueRejected("ALGO_FAILED", str(exc)) from exc
-        return payload["data"]["data"][0].get("algoId", "")
+        row = payload["data"]["data"][0]
+        # OKX uses HTTP/code=0 for an accepted batch request even when the
+        # individual algo row was rejected. ATK therefore returns a normal
+        # payload whose row has sCode/sMsg but no algoId. Treating that as
+        # success writes a fake live STOP and leaves the position naked.
+        row_code = str(row.get("sCode") or "")
+        algo_id = str(row.get("algoId") or "")
+        if row_code not in ("", "0") or not algo_id:
+            message = str(row.get("sMsg") or "venue returned no algoId")
+            error_code = row_code if row_code not in ("", "0") else "ALGO_NO_ID"
+            raise VenueRejected(error_code, message)
+        return algo_id
 
 
     async def get_balances(self) -> dict[str, Decimal]:
@@ -385,7 +408,10 @@ class PaperVenue:
             st.status = OrdStatus.CANCELED
 
     async def get_fills(
-        self, inst_id: str, client_order_id: str | None = None
+        self,
+        inst_id: str,
+        client_order_id: str | None = None,
+        exchange_order_id: str | None = None,
     ) -> list[Fill]:
         if client_order_id:
             return list(self._fills.get(client_order_id, []))

@@ -448,7 +448,13 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
             """SELECT p.position_id, p.intent_id, p.inst_id, p.qty_open,
                       p.avg_entry_px, p.price_r_distance, p.opened_at,
                       coalesce(p.current_stop_px, p.initial_stop_px) AS stop_px,
-                      i.lot_sz, i.min_sz, i.tick_sz
+                      i.lot_sz, i.min_sz, i.tick_sz,
+                      (SELECT o.algo_id FROM orders o
+                       WHERE o.intent_id=p.intent_id AND o.purpose='STOP'
+                       ORDER BY o.created_at DESC LIMIT 1) AS protection_algo_id,
+                      (SELECT o.client_order_id FROM orders o
+                       WHERE o.intent_id=p.intent_id AND o.purpose='STOP'
+                       ORDER BY o.created_at DESC LIMIT 1) AS protection_cid
                FROM positions p
                LEFT JOIN instruments i
                       ON i.venue = 'okx-tr' AND i.inst_id = p.inst_id
@@ -489,7 +495,28 @@ async def sweep_protection(venue: Venue, run_id: int) -> ProtectionSweep:
                         err=str(exc)[:150])
             sweep.unprotected.append(pid)
             continue
-        if any(a.get("state") in LIVE_ALGO_STATES for a in algos):
+        # Protection belongs to a position, not merely to an instrument. Two
+        # BTC positions can coexist; one live BTC OCO covers only its own size
+        # and must not make every other BTC position look protected.
+        mine = next(
+            (
+                a
+                for a in algos
+                if a.get("state") in LIVE_ALGO_STATES
+                and (
+                    (
+                        r["protection_algo_id"]
+                        and a.get("algoId") == r["protection_algo_id"]
+                    )
+                    or (
+                        r["protection_cid"]
+                        and a.get("algoClOrdId") == r["protection_cid"]
+                    )
+                )
+            ),
+            None,
+        )
+        if mine is not None:
             sweep.already_protected.append(pid)
             continue
 

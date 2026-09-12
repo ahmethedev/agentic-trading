@@ -16,6 +16,7 @@ The rules this class exists to enforce (AGENT.md §5):
 
 from __future__ import annotations
 
+import asyncio
 import json
 from dataclasses import dataclass
 from decimal import Decimal
@@ -220,11 +221,20 @@ class OrderManager:
             return EntryOutcome(cid, OrdStatus.REJECTED, Decimal(0), None, {})
 
         await self._record_state(cid, state, event="ACK")
-        await self._ingest_fills(inst_id, cid)
         fresh = await self._venue.get_order(inst_id, cid)
         await self._record_state(cid, fresh, event="POLL")
         await self._sync_intent(intent_id, fresh)
-        totals = await self.filled_totals(cid)
+        totals = await self._ingest_expected_fills(inst_id, cid, fresh)
+        if fresh.qty_filled > totals.qty:
+            await self._mark_fill_pending(cid, intent_id, fresh, totals.qty)
+            return EntryOutcome(
+                cid,
+                fresh.status,
+                fresh.qty_filled,
+                fresh.avg_px,
+                totals.fees,
+                unknown=True,
+            )
         return EntryOutcome(cid, fresh.status, fresh.qty_filled, fresh.avg_px,
                             totals.fees)
 
@@ -262,29 +272,45 @@ class OrderManager:
             return EntryOutcome(cid, OrdStatus.CANCELED, Decimal(0), None, {})
 
         await self._record_state(cid, state, event="RECONCILE")
-        await self._ingest_fills(inst_id, cid)
         await self._sync_intent(intent_id, state)
-        totals = await self.filled_totals(cid)
+        totals = await self._ingest_expected_fills(inst_id, cid, state)
+        if state.qty_filled > totals.qty:
+            await self._mark_fill_pending(cid, intent_id, state, totals.qty)
+            return EntryOutcome(
+                cid,
+                state.status,
+                state.qty_filled,
+                state.avg_px,
+                totals.fees,
+                unknown=True,
+            )
         log.info("order.reconciled", cid=cid, status=str(state.status),
                  filled=str(state.qty_filled))
         return EntryOutcome(cid, state.status, state.qty_filled, state.avg_px,
                             totals.fees)
 
     # ------------------------------------------------------------- fills ----
-    async def _ingest_fills(self, inst_id: str, cid: str) -> int:
+    async def _ingest_fills(
+        self, inst_id: str, cid: str, exchange_order_id: str | None = None
+    ) -> int:
         """Store fills idempotently; return how many were NEW to the ledger.
 
         Deduplication is by the venue fill id, enforced by the primary key, so a
         fill seen from both polling and reconciliation is counted exactly once.
         """
         try:
-            fills = await self._venue.get_fills(inst_id, cid)
+            fills = await self._venue.get_fills(inst_id, cid, exchange_order_id)
         except VenueUnknown as exc:
             log.warning("order.fills_unavailable", cid=cid, err=str(exc)[:150])
             return 0
 
         new_fills = 0
         async with pool.ledger().acquire() as con:
+            # A startup reconciliation runs under a new run id, but a recovered
+            # fill still belongs to the run that sent its order.
+            fill_run_id = await con.fetchval(
+                "SELECT run_id FROM orders WHERE client_order_id=$1", cid
+            )
             for f in fills:
                 inserted = await con.fetchval(
                     """INSERT INTO fills (venue, fill_id, client_order_id,
@@ -293,13 +319,37 @@ class OrderManager:
                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                        ON CONFLICT (venue, fill_id) DO NOTHING
                        RETURNING fill_id""",
-                    VENUE, f.fill_id, f.client_order_id, f.exchange_order_id,
+                    VENUE, f.fill_id, cid, f.exchange_order_id,
                     f.inst_id, f.side, f.px, f.qty, f.fee, f.fee_ccy,
-                    f.liquidity, f.ts, self._run_id,
+                    f.liquidity, f.ts, fill_run_id or self._run_id,
                 )
                 if inserted is not None:
                     new_fills += 1
         return new_fills
+
+    async def _ingest_expected_fills(
+        self, inst_id: str, cid: str, state: OrderState, *, attempts: int = 3
+    ) -> FillTotals:
+        """Wait briefly for fill history to catch up with terminal order state.
+
+        OKX can expose ``accFillSz`` through ``spot_get_order`` a fraction of a
+        second before the same execution appears in ``spot_get_fills``.  Fees
+        and trade ids only exist in the latter, so the order response is not a
+        safe substitute for a stored fill.  Retry the read, then leave an
+        explicit UNKNOWN reservation if the two views still disagree.
+        """
+        totals = await self.filled_totals(cid)
+        expected = state.qty_filled
+        if expected <= totals.qty:
+            return totals
+        for attempt in range(attempts):
+            await self._ingest_fills(inst_id, cid, state.exchange_order_id)
+            totals = await self.filled_totals(cid)
+            if totals.qty >= expected:
+                return totals
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.1 * (2 ** attempt))
+        return totals
 
     async def filled_totals(self, cid: str) -> FillTotals:
         """Quantity, weighted average price and per-currency fees, from STORED
@@ -379,6 +429,36 @@ class OrderManager:
                        VALUES ($1,'TIMEOUT',$2)""",
                     cid, json.dumps({"detail": detail[:500]}))
         log.warning("order.unknown", cid=cid, detail=detail[:200])
+
+    async def _mark_fill_pending(
+        self, cid: str, intent_id: int, state: OrderState, stored_qty: Decimal
+    ) -> None:
+        """Keep the position slot reserved when order and fill views disagree."""
+        detail = {
+            "order_qty_filled": str(state.qty_filled),
+            "stored_fill_qty": str(stored_qty),
+            "exchange_order_id": state.exchange_order_id,
+        }
+        async with pool.ledger().acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    "UPDATE intents SET status='UNKNOWN' WHERE intent_id=$1", intent_id
+                )
+                await con.execute(
+                    """INSERT INTO order_events (client_order_id, event_type, payload)
+                       VALUES ($1,'FILL_PENDING',$2)""",
+                    cid,
+                    json.dumps(detail),
+                )
+                await con.execute(
+                    """INSERT INTO ops_events
+                           (run_id, severity, kind, inst_id, detail)
+                       VALUES ($1,'error','entry_fill_pending',$2,$3)""",
+                    self._run_id,
+                    state.inst_id,
+                    json.dumps({"client_order_id": cid, **detail}),
+                )
+        log.error("order.fill_pending", cid=cid, **detail)
 
     async def _mark_rejected(
         self, cid: str, intent_id: int, code: str, message: str

@@ -103,6 +103,7 @@ class Reconciler:
         report = ReconcileReport()
         await self._release_unsent_intents(report)
         await self._resolve_in_flight_orders(report)
+        await self._recover_terminal_entry_fills(report)
         await self._rebuild_missing_positions(report)
         await self._ingest_exits(report)
         await self._check_positions(report)
@@ -179,7 +180,15 @@ class Reconciler:
                 continue
 
             await self._om._record_state(cid, state, event="STARTUP_RECONCILE")
-            report.fills_ingested += await self._om._ingest_fills(inst, cid)
+            report.fills_ingested += await self._om._ingest_fills(
+                inst, cid, state.exchange_order_id
+            )
+            totals = await self._om.filled_totals(cid)
+            if state.qty_filled > totals.qty:
+                if cid not in report.unresolved:
+                    report.unresolved.append(cid)
+                await self._om._mark_fill_pending(cid, r["intent_id"], state, totals.qty)
+                continue
             if state.status in TERMINAL:
                 report.resolved_orders += 1
             else:
@@ -187,6 +196,64 @@ class Reconciler:
                 report.adopted_orders += 1
                 log.info("reconcile.adopted", cid=cid, status=str(state.status))
             await self._om._sync_intent(r["intent_id"], state)
+
+    async def _recover_terminal_entry_fills(self, report: ReconcileReport) -> None:
+        """Repair fills missed after an order was already marked terminal.
+
+        Terminal orders used to be skipped entirely at startup.  That made a
+        short propagation delay permanent: the exchange said FILLED, while the
+        ledger, chart and position table stayed empty forever.
+        """
+        async with pool.ledger().acquire() as con:
+            rows = await con.fetch(
+                """SELECT o.client_order_id, o.inst_id, o.intent_id,
+                          o.qty_filled, o.exchange_order_id
+                   FROM orders o
+                   WHERE o.purpose='ENTRY' AND o.qty_filled > 0
+                     AND o.qty_filled > coalesce(
+                         (SELECT sum(f.qty) FROM fills f
+                          WHERE f.client_order_id=o.client_order_id), 0)
+                   ORDER BY o.created_at"""
+            )
+        for r in rows:
+            cid, inst = r["client_order_id"], r["inst_id"]
+            try:
+                state = await self._venue.get_order(inst, cid)
+            except VenueUnknown as exc:
+                report.unresolved.append(cid)
+                await self._ops(
+                    "error",
+                    "reconcile_terminal_fill_unreachable",
+                    inst,
+                    {"client_order_id": cid, "error": str(exc)[:300]},
+                )
+                continue
+            if state.status is OrdStatus.UNKNOWN or state.qty_filled <= 0:
+                report.unresolved.append(cid)
+                await self._ops(
+                    "error",
+                    "reconcile_terminal_fill_unknown",
+                    inst,
+                    {"client_order_id": cid},
+                )
+                continue
+
+            report.fills_ingested += await self._om._ingest_fills(
+                inst, cid, state.exchange_order_id
+            )
+            totals = await self._om.filled_totals(cid)
+            if state.qty_filled > totals.qty:
+                if cid not in report.unresolved:
+                    report.unresolved.append(cid)
+                await self._om._mark_fill_pending(cid, r["intent_id"], state, totals.qty)
+                continue
+            report.unresolved = [item for item in report.unresolved if item != cid]
+            await self._om._sync_intent(r["intent_id"], state)
+            log.warning(
+                "reconcile.terminal_fill_recovered",
+                cid=cid,
+                qty=str(totals.qty),
+            )
 
     async def _resolve_algo_order(self, r, report: ReconcileReport) -> None:
         """Ask the ALGO endpoint about a protective order, by its client id."""
@@ -264,7 +331,7 @@ class Reconciler:
         """
         async with pool.ledger().acquire() as con:
             rows = await con.fetch(
-                """SELECT i.intent_id, i.inst_id, i.structural_stop,
+                """SELECT i.intent_id, i.run_id, i.inst_id, i.structural_stop,
                           i.est_cost_per_unit, i.policy_version,
                           o.client_order_id
                    FROM intents i
@@ -292,7 +359,7 @@ class Reconciler:
                 r["inst_id"], Decimal(spec_row["lot_sz"]),
                 Decimal(spec_row["min_sz"]), Decimal(spec_row["tick_sz"]))
             await open_position(
-                self._venue, run_id=self._run_id, intent_id=r["intent_id"],
+                self._venue, run_id=r["run_id"], intent_id=r["intent_id"],
                 inst_id=r["inst_id"], filled_qty=totals.qty,
                 avg_entry_px=totals.avg_px,
                 structural_stop=Decimal(r["structural_stop"]), spec=spec,

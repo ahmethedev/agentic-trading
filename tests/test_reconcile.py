@@ -101,6 +101,33 @@ async def test_order_that_filled_while_down_is_ingested(run_id, decision_id):
     assert await _status(intent_id) == "FILLED"
 
 
+async def test_terminal_order_with_missing_fill_is_recovered(run_id, decision_id):
+    """Startup also repairs an order whose terminal flag hid it from recovery."""
+    venue = PaperVenue()
+    om = OrderManager(venue, run_id)
+    intent_id = await _intent(run_id, decision_id, "FILLED")
+    state = await venue.place_limit_ioc(INST, "buy", D("0.01"), D("100"), "cidlate")
+    async with pool.ledger().acquire() as con:
+        await con.execute(
+            """INSERT INTO orders (client_order_id, intent_id, run_id, venue,
+                   inst_id, exchange_order_id, purpose, side, ord_type,
+                   qty_requested, qty_filled, avg_px, status, sent_at, terminal_at)
+               VALUES ('cidlate',$1,$2,'okx-tr',$3,$4,'ENTRY','buy','ioc',
+                       0.01,0.01,100,'filled',now(),now())""",
+            intent_id, run_id, INST, state.exchange_order_id,
+        )
+
+    report = await Reconciler(venue, om, run_id).run()
+
+    assert report.fills_ingested == 1
+    assert report.positions_rebuilt == 1
+    assert (await om.filled_totals("cidlate")).qty == D("0.01")
+    async with pool.ledger().acquire() as con:
+        assert await con.fetchval(
+            "SELECT count(*) FROM positions WHERE intent_id=$1", intent_id
+        ) == 1
+
+
 async def test_unreachable_venue_blocks_instead_of_assuming_dead(run_id, decision_id):
     """Failing to ask is not an answer. The system must stay blocked."""
     intent_id = await _intent(run_id, decision_id, "UNKNOWN")

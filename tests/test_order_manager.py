@@ -158,6 +158,49 @@ async def test_repeated_ingest_is_idempotent(run_id, decision_id):
     assert (before.qty, before.fees) == (after.qty, after.fees)
 
 
+async def test_fill_history_can_arrive_after_order_state(run_id, decision_id):
+    """A briefly empty fill endpoint must not leave a filled entry unbooked."""
+    class DelayedFills(PaperVenue):
+        calls = 0
+
+        async def get_fills(
+            self, inst_id, client_order_id=None, exchange_order_id=None
+        ):
+            self.calls += 1
+            if self.calls == 1:
+                return []
+            return await super().get_fills(
+                inst_id, client_order_id, exchange_order_id
+            )
+
+    venue = DelayedFills()
+    om = OrderManager(venue, run_id)
+    intent_id = await _reserve(om, decision_id)
+    out = await om.submit_entry(intent_id, INST, D("0.01"), D("100"))
+
+    assert out.unknown is False
+    assert (await om.filled_totals(out.client_order_id)).qty == D("0.01")
+    assert await _intent_status(intent_id) == "FILLED"
+
+
+async def test_missing_fill_history_blocks_new_entries(run_id, decision_id):
+    """A filled order without its fee-bearing fill is unresolved, not success."""
+    class MissingFills(PaperVenue):
+        async def get_fills(
+            self, inst_id, client_order_id=None, exchange_order_id=None
+        ):
+            return []
+
+    venue = MissingFills()
+    om = OrderManager(venue, run_id)
+    intent_id = await _reserve(om, decision_id)
+    out = await om.submit_entry(intent_id, INST, D("0.01"), D("100"))
+
+    assert out.qty_filled == D("0.01")
+    assert out.unknown is True
+    assert await _intent_status(intent_id) == "UNKNOWN"
+
+
 # --------------------------------------------------------------- rejected ---
 async def test_rejection_is_not_retried(run_id, decision_id):
     venue = PaperVenue(faults=Faults(place_reject="INSUFFICIENT_BALANCE"))
