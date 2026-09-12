@@ -202,11 +202,15 @@ class AtkVenue:
         self, inst_id: str, qty: Decimal, tp_trigger: Decimal, sl_trigger: Decimal,
         client_order_id: str,
     ) -> str:
+        # No tgtCcy here. It is valid on spot_place_order but NOT on the algo
+        # endpoint, which rejects the whole request with 51000 "Parameter tgtCcy
+        # error" -- and an OCO that is never accepted is a position with no stop.
+        # `sz` on a spot algo order is always base, which is what we want anyway.
         args = {
             "instId": inst_id, "tdMode": "cash", "side": "sell", "ordType": "oco",
             "sz": str(qty), "tpTriggerPx": str(tp_trigger), "tpOrdPx": "-1",
             "slTriggerPx": str(sl_trigger), "slOrdPx": "-1",
-            "algoClOrdId": client_order_id, "tgtCcy": "base_ccy",
+            "algoClOrdId": client_order_id,
         }
         try:
             payload = await self._atk.call("spot_place_algo_order", args)

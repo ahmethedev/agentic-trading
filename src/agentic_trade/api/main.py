@@ -285,9 +285,14 @@ async def positions() -> dict[str, Any]:
     async with pool.ledger().acquire() as con:
         rows = await con.fetch(
             """SELECT p.*, i.qty_requested,
+                      -- Only protection that is still LIVE counts. Counting any
+                      -- STOP row with an algo id reported a naked position as
+                      -- protected, because a cancelled or never-accepted OCO
+                      -- keeps both its row and its algo id.
                       (SELECT count(*) FROM orders o
                         WHERE o.intent_id=p.intent_id AND o.purpose='STOP'
-                          AND o.algo_id IS NOT NULL) AS protection_orders
+                          AND o.algo_id IS NOT NULL
+                          AND o.terminal_at IS NULL) AS protection_orders
                FROM positions p LEFT JOIN intents i USING (intent_id)
                ORDER BY p.opened_at DESC LIMIT 25"""
         )

@@ -29,7 +29,7 @@ import structlog
 from ..db import pool
 from ..risk.sizing import InstrumentSpec
 from .order_manager import OrderManager
-from .position import open_position, sweep_protection
+from .position import LIVE_ALGO_STATES, open_position, sweep_protection
 from .venue import TERMINAL, OrdStatus, Venue, VenueUnknown
 
 log = structlog.get_logger(__name__)
@@ -135,7 +135,7 @@ class Reconciler:
         async with pool.ledger().acquire() as con:
             rows = await con.fetch(
                 """SELECT o.client_order_id, o.inst_id, o.intent_id, o.status,
-                          o.purpose
+                          o.purpose, o.ord_type, o.algo_id
                    FROM orders o
                    WHERE o.terminal_at IS NULL
                    ORDER BY o.created_at"""
@@ -143,6 +143,13 @@ class Reconciler:
         for r in rows:
             cid = r["client_order_id"]
             inst = r["inst_id"]
+            # An algo order is invisible to the regular order endpoint. Asking
+            # about it there returns "no such order", which previously marked a
+            # perfectly live OCO as NOT_PLACED -- the ledger then believed the
+            # position had no protection while the venue was still holding one.
+            if r["ord_type"] == "oco":
+                await self._resolve_algo_order(r, report)
+                continue
             try:
                 state = await self._venue.get_order(inst, cid)
             except VenueUnknown as exc:
@@ -169,6 +176,55 @@ class Reconciler:
                 report.adopted_orders += 1
                 log.info("reconcile.adopted", cid=cid, status=str(state.status))
             await self._om._sync_intent(r["intent_id"], state)
+
+    async def _resolve_algo_order(self, r, report: ReconcileReport) -> None:
+        """Ask the ALGO endpoint about a protective order, by its client id."""
+        cid, inst = r["client_order_id"], r["inst_id"]
+        try:
+            algos = await self._venue.get_algo_orders(inst)
+        except VenueUnknown as exc:
+            report.unresolved.append(cid)
+            log.error("reconcile.unreachable", cid=cid, err=str(exc)[:160])
+            await self._ops("error", "reconcile_unreachable", inst,
+                            {"client_order_id": cid, "error": str(exc)[:300]})
+            return
+
+        mine = next(
+            (a for a in algos
+             if a.get("algoClOrdId") == cid
+             or (r["algo_id"] and a.get("algoId") == r["algo_id"])),
+            None,
+        )
+        if mine is None:
+            # Gone from the venue: triggered, cancelled, or never accepted. The
+            # protection sweep decides whether the position needs a new one.
+            await self._mark_not_placed(cid, r["intent_id"])
+            report.resolved_orders += 1
+            return
+
+        state = mine.get("state", "")
+        if state in LIVE_ALGO_STATES:
+            report.adopted_orders += 1
+            async with pool.ledger().acquire() as con:
+                await con.execute(
+                    """UPDATE orders SET status=$2, last_reconciled_at=now()
+                       WHERE client_order_id=$1""", cid, state)
+            log.info("reconcile.adopted_algo", cid=cid, state=state)
+            return
+
+        async with pool.ledger().acquire() as con:
+            async with con.transaction():
+                await con.execute(
+                    """UPDATE orders SET status=$2, terminal_at=now(),
+                           last_reconciled_at=now()
+                       WHERE client_order_id=$1 AND terminal_at IS NULL""",
+                    cid, state)
+                await con.execute(
+                    """INSERT INTO order_events (client_order_id, event_type, payload)
+                       VALUES ($1,'RECONCILE_ALGO',$2)""",
+                    cid, json.dumps({"state": state, "algo_id": mine.get("algoId")}))
+        report.resolved_orders += 1
+        log.info("reconcile.algo_terminal", cid=cid, state=state)
 
     async def _mark_not_placed(self, cid: str, intent_id: int) -> None:
         async with pool.ledger().acquire() as con:
